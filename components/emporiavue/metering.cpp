@@ -8,45 +8,117 @@
 #include <cinttypes>
 #include <cmath>
 #include <string>
+#include <sys/time.h>
 
 namespace esphome {
 namespace emporiavue {
 
 void MeteringDailyEnergy::setup() {
-  // Stored values remain Wh under the same entity preference key.
-  float initial_value = 0.0f;
   if (this->restore_) {
-    this->pref_ = this->make_entity_preference<float>();
-    this->pref_.load(&initial_value);
+    this->pref_ = global_preferences->make_preference<RestoreState>(this->preference_key_);
+    RestoreState restored{};
+    if (this->pref_.load(&restored) && std::isfinite(restored.energy_wh)) {
+      this->total_energy_ = restored.energy_wh;
+      this->current_day_key_ = restored.day_key;
+    }
   }
-  this->publish_state_and_save(initial_value);
+  this->publish_state_and_save(this->total_energy_);
   this->last_update_ = App.get_loop_component_start_time();
-  this->parent_->add_on_state_callback([this](float state) { this->process_metering_state_(state); });
+  if (!this->external_integration_) {
+    this->parent_->add_on_state_callback([this](float state) { this->process_metering_state_(state); });
+  }
   this->schedule_midnight_reset_();
   this->time_->add_on_time_sync_callback([this]() { this->schedule_midnight_reset_(); });
 }
 
 void MeteringDailyEnergy::dump_config() { LOG_SENSOR("", "Metering Daily Energy", this); }
 
-void MeteringDailyEnergy::publish_state_and_save(float state) {
+void MeteringDailyEnergy::publish_state_and_save(double state) {
   this->total_energy_ = state;
-  // Convert before entering the user filter chain; persistence stays in Wh.
-  this->publish_state(state * this->energy_scale_);
+  // Keep sub-Wh additions in double precision; only the published sensor is float.
+  this->publish_state(static_cast<float>(state * this->energy_scale_));
   if (this->restore_) {
-    this->pref_.save(&state);
+    RestoreState restored{};
+    restored.energy_wh = state;
+    restored.day_key = this->current_day_key_;
+    this->pref_.save(&restored);
   }
 }
 
-void MeteringDailyEnergy::schedule_midnight_reset_() {
+void MeteringDailyEnergy::check_day_() {
   const auto now = this->time_->now();
   if (!now.is_valid()) {
     return;
   }
-  if (this->last_day_of_year_ != now.day_of_year) {
-    if (this->last_day_of_year_ != 0) {
-      this->publish_state_and_save(0.0f);
+  const uint32_t day_key = static_cast<uint32_t>(now.year) * 1000U + now.day_of_year;
+  if (!this->day_initialized_) {
+    // Preserve same-day OTA values. After a missed midnight only measurements
+    // collected since this boot belong to the newly established day.
+    const double energy = this->current_day_key_ == day_key ? this->total_energy_ : this->unassigned_energy_wh_;
+    this->current_day_key_ = day_key;
+    this->day_initialized_ = true;
+    this->unassigned_energy_wh_ = 0.0;
+    this->publish_state_and_save(energy);
+  } else if (this->current_day_key_ != day_key) {
+    this->current_day_key_ = day_key;
+    this->sample_initialized_ = false;
+    this->publish_state_and_save(0.0);
+  }
+}
+
+void MeteringDailyEnergy::add_integral_wh(double energy_wh, uint32_t day_key) {
+  if (!std::isfinite(energy_wh)) {
+    return;
+  }
+  this->check_day_();
+  if (day_key != 0 && this->day_initialized_ && day_key != this->current_day_key_) {
+    return;
+  }
+  if (!this->day_initialized_) {
+    this->unassigned_energy_wh_ += energy_wh;
+  }
+  this->publish_state_and_save(this->total_energy_ + energy_wh);
+}
+
+double MeteringDailyEnergy::interval_duration_today_ms_(double duration_ms, uint32_t age_ms,
+                                                       double elapsed_today_ms) {
+  return std::max(0.0, std::min(duration_ms, elapsed_today_ms - static_cast<double>(age_ms)));
+}
+
+double MeteringDailyEnergy::interval_energy_wh(float power, double duration_ms, uint32_t end_ms,
+                                              uint32_t *day_key) const {
+  if (day_key != nullptr) {
+    *day_key = 0;
+  }
+  if (!std::isfinite(power) || !std::isfinite(duration_ms) || duration_ms <= 0.0) {
+    return 0.0;
+  }
+  struct timeval wall_time{};
+  const bool has_subseconds = gettimeofday(&wall_time, nullptr) == 0;
+  const auto now = this->time_->now();
+  if (now.is_valid()) {
+    if (day_key != nullptr) {
+      *day_key = static_cast<uint32_t>(now.year) * 1000U + now.day_of_year;
     }
-    this->last_day_of_year_ = now.day_of_year;
+    const uint32_t age_ms = millis() - end_ms;
+    // Read wall time before the local date. If the second rolled over in
+    // between, zero milliseconds is a conservative boundary, not yesterday's
+    // fractional second accidentally attached to today's midnight.
+    const double fractional_ms = has_subseconds && wall_time.tv_sec == now.timestamp
+                                     ? static_cast<double>(wall_time.tv_usec) / 1000.0
+                                     : 0.0;
+    const double elapsed_today_ms =
+        ((now.hour * 60.0 + now.minute) * 60.0 + now.second) * 1000.0 + fractional_ms;
+    duration_ms = interval_duration_today_ms_(duration_ms, age_ms, elapsed_today_ms);
+  }
+  return static_cast<double>(power) * duration_ms / 3600000.0;
+}
+
+void MeteringDailyEnergy::schedule_midnight_reset_() {
+  this->check_day_();
+  const auto now = this->time_->now();
+  if (!now.is_valid()) {
+    return;
   }
   const uint32_t seconds_until_midnight =
       ((23U - now.hour) * 60U + (59U - now.minute)) * 60U + (60U - now.second);
@@ -61,6 +133,7 @@ void MeteringDailyEnergy::schedule_midnight_reset_() {
 }
 
 void MeteringDailyEnergy::process_metering_state_(float state) {
+  this->check_day_();
   if (!std::isfinite(state)) {
     this->sample_initialized_ = false;
     return;
@@ -73,16 +146,16 @@ void MeteringDailyEnergy::process_metering_state_(float state) {
     this->sample_initialized_ = true;
     return;
   }
-  const float delta_hours = (now - this->last_update_) / 1000.0f / 3600.0f;
-  float power = this->last_power_state_;
+  const double delta_hours = (now - this->last_update_) / 3600000.0;
+  double power = this->last_power_state_;
   if (this->method_ == MeteringEnergyMethod::RIGHT) {
     power = state;
   } else if (this->method_ == MeteringEnergyMethod::TRAPEZOID) {
-    power = (this->last_power_state_ + state) * 0.5f;
+    power = (static_cast<double>(this->last_power_state_) + state) * 0.5;
   }
   this->last_update_ = now;
   this->last_power_state_ = state;
-  this->publish_state_and_save(this->total_energy_ + delta_hours * power);
+  this->add_integral_wh(delta_hours * power);
 }
 
 void MeteringDemandTracker::setup() {
@@ -94,7 +167,7 @@ void MeteringDemandTracker::setup() {
   this->reset_window_(false);
 
   if (this->maximum_sensor_ != nullptr && this->restore_) {
-    this->pref_ = global_preferences->make_preference<RestoreState>(this->maximum_sensor_->get_object_id_hash());
+    this->pref_ = global_preferences->make_preference<RestoreState>(this->preference_key_);
     this->pref_initialized_ = true;
     this->restored_state_valid_ = this->pref_.load(&this->restored_state_);
   }
@@ -141,7 +214,7 @@ void MeteringDemandTracker::reset_daily_maximum_(uint32_t day_key, uint32_t now_
   this->publish_and_save_maximum_(NAN);
 }
 
-void MeteringDemandTracker::check_day_(uint32_t now_ms) {
+void MeteringDemandTracker::check_day_(uint32_t) {
   if (this->maximum_sensor_ == nullptr || this->time_ == nullptr) {
     return;
   }
@@ -149,6 +222,9 @@ void MeteringDemandTracker::check_day_(uint32_t now_ms) {
   if (!now.is_valid()) {
     return;
   }
+  // Calendar time belongs to the main-loop observation, not necessarily to
+  // the older acquisition endpoint of a queued SPI window.
+  const uint32_t observed_ms = millis();
   const uint32_t day_key = day_key_(now);
   if (this->current_day_key_ == 0) {
     if (this->restored_state_valid_ && this->restored_state_.day_key == day_key) {
@@ -156,15 +232,15 @@ void MeteringDemandTracker::check_day_(uint32_t now_ms) {
       this->daily_maximum_ = this->restored_state_.maximum;
       this->daily_maximum_valid_ = !std::isnan(this->daily_maximum_);
       this->daily_window_start_ms_ =
-          this->daily_maximum_valid_ ? now_ms - this->interval_ms_ : now_ms;
+          this->daily_maximum_valid_ ? observed_ms - this->interval_ms_ : observed_ms;
       this->maximum_sensor_->publish_state(this->daily_maximum_);
     } else {
-      this->reset_daily_maximum_(day_key, now_ms);
+      this->reset_daily_maximum_(day_key, observed_ms);
     }
     return;
   }
   if (day_key != this->current_day_key_) {
-    this->reset_daily_maximum_(day_key, now_ms);
+    this->reset_daily_maximum_(day_key, observed_ms);
   }
 }
 
@@ -195,7 +271,10 @@ void MeteringDemandTracker::finish_bucket_(uint32_t now_ms) {
     return;
   }
   this->check_day_(now_ms);
-  if (this->current_day_key_ == 0 || (now_ms - this->daily_window_start_ms_) < this->interval_ms_) {
+  const uint32_t elapsed_today_ms = now_ms - this->daily_window_start_ms_;
+  // A queued acquisition can end before the newly observed day anchor. Its
+  // unsigned subtraction must not masquerade as a fully elapsed daily window.
+  if (this->current_day_key_ == 0 || elapsed_today_ms > INT32_MAX || elapsed_today_ms < this->interval_ms_) {
     return;
   }
   if (!this->daily_maximum_valid_ || demand > this->daily_maximum_) {
@@ -207,7 +286,7 @@ void MeteringDemandTracker::add_sample(float value, uint32_t now_ms) {
   if (!this->enabled()) {
     return;
   }
-  if (std::isnan(value)) {
+  if (!std::isfinite(value)) {
     this->reset_window_(true);
     return;
   }
@@ -228,17 +307,32 @@ void MeteringDemandTracker::add_sample(float value, uint32_t now_ms) {
     return;
   }
 
-  while (elapsed_ms > 0) {
-    const uint32_t remaining_ms = BUCKET_DURATION_MS - this->current_bucket_elapsed_ms_;
-    const uint32_t chunk_ms = std::min(elapsed_ms, remaining_ms);
-    this->current_bucket_integral_ += static_cast<double>(this->last_value_) * chunk_ms;
+  this->add_interval_sample(this->last_value_, elapsed_ms, now_ms);
+  this->last_value_ = value;
+}
+
+void MeteringDemandTracker::add_interval_sample(float value, double duration_ms, uint32_t end_ms) {
+  if (!this->enabled()) {
+    return;
+  }
+  if (!std::isfinite(value) || !std::isfinite(duration_ms) || duration_ms < 0.0 ||
+      duration_ms > MAX_SAMPLE_GAP_MS) {
+    this->reset_window_(true);
+    return;
+  }
+  // SPI windows carry their real acquisition duration. Queued windows must not
+  // inherit the timing of the ESPHome loop that eventually publishes them.
+  double elapsed_ms = duration_ms;
+  while (elapsed_ms > 0.0) {
+    const double remaining_ms = BUCKET_DURATION_MS - this->current_bucket_elapsed_ms_;
+    const double chunk_ms = std::min(elapsed_ms, remaining_ms);
+    this->current_bucket_integral_ += static_cast<double>(value) * chunk_ms;
     this->current_bucket_elapsed_ms_ += chunk_ms;
     elapsed_ms -= chunk_ms;
-    if (this->current_bucket_elapsed_ms_ == BUCKET_DURATION_MS) {
-      this->finish_bucket_(now_ms - elapsed_ms);
+    if (this->current_bucket_elapsed_ms_ >= BUCKET_DURATION_MS) {
+      this->finish_bucket_(end_ms - static_cast<uint32_t>(elapsed_ms + 0.5));
     }
   }
-  this->last_value_ = value;
 }
 
 void MeteringPeakTracker::finish_window_(uint32_t now_ms) {
@@ -293,7 +387,41 @@ void MeteringPeakTracker::add_sample(float current_peak, float current_crest_fac
   }
 }
 
-void EmporiaVueComponent::submit_metering_frame_(const MeteringFrame &frame) {
+bool MeteringAnalysisTracker::add_sample(float active_power, float reactive_power, float voltage,
+                                        float duration_ms, float minimum_current, Result *result) {
+  if (!std::isfinite(active_power) || !std::isfinite(reactive_power) || !std::isfinite(voltage) ||
+      voltage <= 0.0f || !std::isfinite(duration_ms) || duration_ms <= 0.0f) {
+    this->reset();
+    *result = Result{};
+    return true;
+  }
+  this->active_power_sum_ += static_cast<double>(active_power) * duration_ms;
+  this->reactive_power_sum_ += static_cast<double>(reactive_power) * duration_ms;
+  this->voltage_sum_ += static_cast<double>(voltage) * duration_ms;
+  this->duration_ms_ += duration_ms;
+  if (this->duration_ms_ < this->interval_ms_) {
+    return false;
+  }
+
+  const float mean_active_power = this->active_power_sum_ / this->duration_ms_;
+  const float mean_reactive_power = this->reactive_power_sum_ / this->duration_ms_;
+  const float mean_voltage = this->voltage_sum_ / this->duration_ms_;
+  this->reset();
+  *result = Result{};
+  result->reactive_power = mean_reactive_power;
+  const float magnitude = std::hypot(mean_active_power, mean_reactive_power);
+  // Cancellation, like low current, leaves no meaningful resultant angle.
+  if (magnitude > 0.0f && magnitude >= mean_voltage * minimum_current) {
+    result->power_factor = std::min(1.0f, std::fabs(mean_active_power) / magnitude);
+    result->displacement_angle =
+        std::atan2(mean_reactive_power, mean_active_power) * 180.0f / 3.14159265358979323846f;
+  } else {
+    result->reactive_power = 0.0f;
+  }
+  return true;
+}
+
+void EmporiaVueComponent::submit_metering_frame_(const MeteringFrame &frame, bool publish) {
   const uint32_t now = millis();
   if (!frame.valid || (now - frame.timestamp_ms) > this->metering_timeout_ms_) {
     return;
@@ -303,7 +431,16 @@ void EmporiaVueComponent::submit_metering_frame_(const MeteringFrame &frame) {
   if (!this->metering_data_stale_ && (now - this->last_metering_frame_ms_) > this->metering_timeout_ms_) {
     this->invalidate_metering_(now);
   }
+  if (frame.transport == MeteringTransport::SPI && this->last_metering_sequence_valid_ &&
+      this->last_metering_transport_ == MeteringTransport::SPI &&
+      (frame.acquisition_epoch != this->last_metering_acquisition_epoch_ ||
+       static_cast<uint32_t>(frame.sequence - this->last_metering_sequence_) != 1U)) {
+    // Completed energy is retained. Only unfinished demand/peak/analysis and
+    // detection baselines must not bridge dropped windows or a stream restart.
+    this->invalidate_metering_(now);
+  }
   this->last_metering_frame_ms_ = frame.timestamp_ms;
+  this->last_metering_acquisition_epoch_ = frame.acquisition_epoch;
   this->metering_data_stale_ = false;
 
   if (this->last_metering_sequence_valid_ && frame.transport == MeteringTransport::I2C &&
@@ -322,7 +459,7 @@ void EmporiaVueComponent::submit_metering_frame_(const MeteringFrame &frame) {
                           frame.transport == MeteringTransport::I2C ? "I2C" : "unknown";
   ESP_LOGV(TAG, "SAMD09 %s metering frame: seq=%" PRIu32 ", flags=0x%02x", transport, frame.sequence,
            frame.quality_flags);
-  this->publish_metering_frame_(frame);
+  this->publish_metering_frame_(frame, publish);
 }
 
 void EmporiaVueComponent::check_metering_timeout_(uint32_t now_ms) {
@@ -342,7 +479,7 @@ void EmporiaVueComponent::invalidate_metering_(uint32_t now_ms) {
   this->metering_data_stale_ = true;
   this->last_unavailable_publish_ms_ = now_ms;
   if (first_timeout) {
-    ESP_LOGW(TAG, "No fresh metering values for %" PRIu32 "ms; suspending measurements and energy integration",
+    ESP_LOGW(TAG, "Metering continuity lost (age=%" PRIu32 "ms); suspending measurements and gap integration",
              now_ms - this->last_metering_frame_ms_);
   }
   auto unavailable = [](sensor::Sensor *sensor) {
@@ -372,6 +509,8 @@ void EmporiaVueComponent::invalidate_metering_(uint32_t now_ms) {
     unavailable(ct->get_power_split_line_a_sensor());
     unavailable(ct->get_power_split_line_b_sensor());
     ct->invalidate_peak(now_ms);
+    ct->get_analysis_tracker().reset();
+    ct->clear_pending_analysis();
     if (first_timeout) {
       ct->add_power_demand_sample(NAN, now_ms);
       ct->add_current_demand_sample(NAN, now_ms);
@@ -450,11 +589,13 @@ bool EmporiaVueComponent::calculate_ct_fundamental_phasors_(
     *current_i = corrected_i;
     *current_q = corrected_q;
   }
-  return true;
+  return std::isfinite(*voltage_i) && std::isfinite(*voltage_q) && std::isfinite(*current_i) &&
+         std::isfinite(*current_q);
 }
 
-bool EmporiaVueComponent::calculate_ct_power_(const MeteringFrame &frame, const MeteringCTClampConfig *ct_clamp,
-                                              float *power) const {
+bool EmporiaVueComponent::calculate_ct_physical_power_(const MeteringFrame &frame,
+                                                       const MeteringCTClampConfig *ct_clamp,
+                                                       float *power) const {
   if (ct_clamp == nullptr || power == nullptr) {
     return false;
   }
@@ -511,8 +652,17 @@ bool EmporiaVueComponent::calculate_ct_power_(const MeteringFrame &frame, const 
     }
   }
 
-  *power = ct_clamp->apply_power_filters(corrected_power);
-  return true;
+  *power = corrected_power;
+  return std::isfinite(*power);
+}
+
+bool EmporiaVueComponent::calculate_ct_power_(const MeteringFrame &frame, const MeteringCTClampConfig *ct_clamp,
+                                              float *power) const {
+  if (!this->calculate_ct_physical_power_(frame, ct_clamp, power)) {
+    return false;
+  }
+  *power = ct_clamp->apply_power_filters(*power);
+  return std::isfinite(*power);
 }
 
 bool EmporiaVueComponent::calculate_phase_voltage_(const MeteringFrame &frame, const MeteringPhaseConfig *phase,
@@ -522,7 +672,7 @@ bool EmporiaVueComponent::calculate_phase_voltage_(const MeteringFrame &frame, c
   }
 
   *voltage = frame.phases[phase->get_input_wire()].voltage_raw * phase->get_calibration();
-  return true;
+  return std::isfinite(*voltage) && *voltage >= 0.0f;
 }
 
 bool EmporiaVueComponent::calculate_line_to_line_voltage_(const MeteringFrame &frame,
@@ -595,7 +745,7 @@ bool EmporiaVueComponent::calculate_ct_current_(const MeteringFrame &frame, cons
   }
   const float scalar = port < 3 ? (775.0f / 42624.0f) : (775.0f / 170496.0f);
   *current = frame.clamps[port].current_raw * scalar * ct_clamp->get_current_gain();
-  return true;
+  return std::isfinite(*current) && *current >= 0.0f;
 }
 
 bool EmporiaVueComponent::calculate_ct_apparent_power_(const MeteringFrame &frame,
@@ -612,8 +762,8 @@ bool EmporiaVueComponent::calculate_ct_apparent_power_(const MeteringFrame &fram
     return false;
   }
 
-  *apparent_power = std::fabs(ct_clamp->apply_power_filters(voltage * current));
-  return true;
+  *apparent_power = voltage * current;
+  return std::isfinite(*apparent_power);
 }
 
 bool EmporiaVueComponent::calculate_ct_measurement_(const MeteringFrame &frame,
@@ -624,18 +774,25 @@ bool EmporiaVueComponent::calculate_ct_measurement_(const MeteringFrame &frame,
   }
 
   *measurement = MeteringCTMeasurement{};
-  measurement->has_power = this->calculate_ct_power_(frame, ct_clamp, &measurement->power);
+  float physical_power = 0.0f;
+  const bool has_physical_power = this->calculate_ct_physical_power_(frame, ct_clamp, &physical_power);
+  if (has_physical_power) {
+    measurement->power = ct_clamp->apply_power_filters(physical_power);
+    measurement->has_power = std::isfinite(measurement->power);
+  }
   measurement->has_voltage = this->calculate_ct_voltage_(frame, ct_clamp, &measurement->voltage);
   measurement->has_current = this->calculate_ct_current_(frame, ct_clamp, &measurement->current);
   if (measurement->has_voltage && measurement->has_current) {
-    measurement->apparent_power =
-        std::fabs(ct_clamp->apply_power_filters(measurement->voltage * measurement->current));
-    measurement->has_apparent_power = true;
-    measurement->has_power_factor = true;
-    if (measurement->apparent_power >= this->minimum_apparent_power_ && measurement->apparent_power > 0.0f &&
-        measurement->has_power) {
+    // Arbitrary active-power corrections must not change physical S or PF.
+    measurement->apparent_power = measurement->voltage * measurement->current;
+    measurement->has_apparent_power = std::isfinite(measurement->apparent_power);
+    const float consistency_tolerance = std::max(0.5f, measurement->apparent_power * 0.01f);
+    if (measurement->has_apparent_power && has_physical_power &&
+        measurement->apparent_power >= this->minimum_apparent_power_ && measurement->apparent_power > 0.0f &&
+        std::fabs(physical_power) <= measurement->apparent_power + consistency_tolerance) {
+      measurement->has_power_factor = true;
       measurement->power_factor =
-          std::max(0.0f, std::min(1.0f, std::fabs(measurement->power) / measurement->apparent_power));
+          std::min(1.0f, std::fabs(physical_power) / measurement->apparent_power);
     }
   }
   return measurement->has_power || measurement->has_voltage || measurement->has_current ||
@@ -660,11 +817,9 @@ bool EmporiaVueComponent::calculate_ct_fundamental_analysis_(const MeteringFrame
   const float fundamental_current = std::hypot(current_i, current_q);
   measurement->has_fundamental_analysis = true;
   measurement->fundamental_current = fundamental_current;
-
-  if (fundamental_current < this->minimum_fundamental_current_) {
-    measurement->fundamental_current = 0.0f;
-    measurement->fundamental_reactive_power = 0.0f;
-    return true;
+  const bool windowed_analysis = ct_clamp->get_analysis_interval() != 0 && ct_clamp->has_fundamental_power_analysis();
+  if (windowed_analysis) {
+    measurement->fundamental_voltage = std::hypot(voltage_i, voltage_q);
   }
 
   const bool reactive_power_required = ct_clamp->get_fundamental_reactive_power_sensor() != nullptr;
@@ -674,16 +829,26 @@ bool EmporiaVueComponent::calculate_ct_fundamental_analysis_(const MeteringFrame
 
   float active_power = 0.0f;
   float reactive_power = 0.0f;
-  if (power_factor_required || displacement_angle_required) {
+  if (windowed_analysis || power_factor_required || displacement_angle_required) {
     active_power = voltage_i * current_i + voltage_q * current_q;
   }
-  if (reactive_power_required || displacement_angle_required) {
+  if (windowed_analysis || reactive_power_required || displacement_angle_required) {
     reactive_power = voltage_i * current_q - voltage_q * current_i;
   }
-  if (reactive_power_required) {
+  measurement->fundamental_active_power = active_power;
+  if (windowed_analysis || reactive_power_required) {
     measurement->fundamental_reactive_power = reactive_power;
   }
-  if (power_factor_required || displacement_angle_required) {
+  if (fundamental_current < this->minimum_fundamental_current_) {
+    measurement->fundamental_current = 0.0f;
+    if (!windowed_analysis) {
+      measurement->fundamental_reactive_power = 0.0f;
+    }
+    // Windowed power analysis applies its cutoff after P/Q averaging, avoiding
+    // bias from clipping individual readings that fluctuate around the threshold.
+    return true;
+  }
+  if (!windowed_analysis && (power_factor_required || displacement_angle_required)) {
     const float fundamental_voltage = std::hypot(voltage_i, voltage_q);
     const float apparent_power = fundamental_voltage * fundamental_current;
     if (apparent_power > 0.0f) {
@@ -709,6 +874,32 @@ bool EmporiaVueComponent::calculate_ct_fundamental_analysis_(const MeteringFrame
   return true;
 }
 
+bool EmporiaVueComponent::prepare_ct_power_analysis_(const MeteringFrame &frame, MeteringCTClampConfig *ct_clamp,
+                                                    MeteringCTMeasurement *measurement) const {
+  if (ct_clamp->get_analysis_interval() == 0 || !ct_clamp->has_fundamental_power_analysis()) {
+    return true;
+  }
+  auto &tracker = ct_clamp->get_analysis_tracker();
+  if (!measurement->has_fundamental_analysis) {
+    tracker.reset();
+    return true;  // Publish unavailable immediately; never average across invalid data.
+  }
+  const auto *phase_a = ct_clamp->get_phase();
+  const auto *phase_b = ct_clamp->get_line_pair_phase_b();
+  tracker.set_voltage_calibration(phase_a == nullptr ? 0.0f : phase_a->get_calibration(),
+                                  phase_b == nullptr ? 0.0f : phase_b->get_calibration());
+  MeteringAnalysisTracker::Result result;
+  if (!tracker.add_sample(measurement->fundamental_active_power, measurement->fundamental_reactive_power,
+                           measurement->fundamental_voltage, frame.duration_ms,
+                           this->minimum_fundamental_current_, &result)) {
+    return false;
+  }
+  measurement->fundamental_reactive_power = result.reactive_power;
+  measurement->fundamental_power_factor = result.power_factor;
+  measurement->displacement_angle = result.displacement_angle;
+  return true;
+}
+
 float EmporiaVueComponent::apply_power_direction_(float power, uint8_t direction) {
   if (std::isnan(power)) {
     return power;
@@ -724,9 +915,15 @@ float EmporiaVueComponent::apply_power_direction_(float power, uint8_t direction
   }
 }
 
-void EmporiaVueComponent::publish_power_outputs_(const std::vector<MeteringPowerOutput> &outputs, float power) {
+void EmporiaVueComponent::publish_power_outputs_(const std::vector<MeteringPowerOutput> &outputs, float power,
+                                                float duration_ms, bool publish, uint32_t end_ms) {
   for (const auto &output : outputs) {
     const float directed_power = apply_power_direction_(power, output.get_direction());
+    output.accumulate_energy(directed_power, duration_ms, end_ms);
+    if (!publish) {
+      continue;
+    }
+    output.publish_energy();
     if (output.get_raw_power_sensor() != nullptr) {
       output.get_raw_power_sensor()->publish_state(directed_power);
     }
@@ -799,6 +996,10 @@ bool EmporiaVueComponent::calculate_group_power_(const MeteringFrame &frame, Met
   }
 
   *group_power = group->apply_power_filters(sum);
+  if (!std::isfinite(*group_power)) {
+    group_cache.mark_invalid(generation);
+    return false;
+  }
   group_cache.store(generation, *group_power);
   return true;
 }
@@ -839,7 +1040,7 @@ void EmporiaVueComponent::update_line_detection_(const MeteringFrame &frame, Met
 
   const float current_scalar = port < 3 ? (775.0f / 42624.0f) : (775.0f / 170496.0f);
   const float sample_current = frame.clamps[port].current_raw * current_scalar * ct_clamp->get_current_gain();
-  const uint32_t now = millis();
+  const uint32_t now = frame.transport == MeteringTransport::SPI ? frame.timestamp_ms : millis();
 
   auto update_state = [&](MeteringLineDetectionState &detection, bool export_direction, float power_min,
                           text_sensor::TextSensor *sensor, const char *detection_name) -> uint8_t {
@@ -1063,11 +1264,13 @@ void EmporiaVueComponent::update_line_detection_(const MeteringFrame &frame, Met
   }
 }
 
-void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame) {
+void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame, bool publish) {
   if (!frame.valid) {
     return;
   }
-  const uint32_t demand_now_ms = millis();
+  const bool acquisition_timed = frame.transport == MeteringTransport::SPI;
+  const uint32_t demand_now_ms = acquisition_timed ? frame.timestamp_ms : millis();
+  const float energy_duration_ms = acquisition_timed ? frame.duration_ms : 0.0f;
   if (++this->metering_calculation_generation_ == 0) {
     this->metering_calculation_generation_ = 1;
   }
@@ -1079,16 +1282,16 @@ void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame) {
       continue;
     }
 
-    if (phase->get_voltage_sensor() != nullptr) {
+    if (publish && phase->get_voltage_sensor() != nullptr) {
       phase->get_voltage_sensor()->publish_state(frame.phases[input].voltage_raw * phase->get_calibration());
     }
-    if (phase->get_frequency_sensor() != nullptr) {
+    if (publish && phase->get_frequency_sensor() != nullptr) {
       phase->get_frequency_sensor()->publish_state(frame.phases[input].frequency_hz);
     }
-    if (phase->get_phase_angle_sensor() != nullptr && input > 0) {
+    if (publish && phase->get_phase_angle_sensor() != nullptr && input > 0) {
       phase->get_phase_angle_sensor()->publish_state(frame.phases[input].phase_angle_degrees);
     }
-    if (phase->get_voltage_thd_sensor() != nullptr) {
+    if (publish && phase->get_voltage_thd_sensor() != nullptr) {
       phase->get_voltage_thd_sensor()->publish_state(frame.phases[input].voltage_thd_valid
                                                          ? frame.phases[input].voltage_thd_percent
                                                          : std::numeric_limits<float>::quiet_NaN());
@@ -1096,7 +1299,7 @@ void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame) {
   }
 
   for (auto *virtual_line : this->metering_virtual_lines_) {
-    if (virtual_line->get_voltage_sensor() == nullptr) {
+    if (!publish || virtual_line->get_voltage_sensor() == nullptr) {
       continue;
     }
     const MeteringPhaseConfig *line_a = virtual_line->get_line_a();
@@ -1133,10 +1336,18 @@ void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame) {
     const bool has_fundamental_analysis = ct_clamp->has_fundamental_analysis() &&
                                           this->calculate_ct_fundamental_analysis_(frame, ct_clamp, &measurement);
     const float unavailable = std::numeric_limits<float>::quiet_NaN();
+    if (acquisition_timed) {
+      ct_clamp->add_demand_interval(measurement.has_power ? measurement.power : unavailable,
+                                    measurement.has_current ? measurement.current : unavailable,
+                                    frame.duration_ms, demand_now_ms);
+    }
     if (measurement.has_power) {
-      ct_clamp->add_power_demand_sample(measurement.power, demand_now_ms);
-      publish_power_outputs_(ct_clamp->get_power_outputs(), measurement.power);
-      if (ct_clamp->is_line_pair()) {
+      if (!acquisition_timed) {
+        ct_clamp->add_power_demand_sample(measurement.power, demand_now_ms);
+      }
+      publish_power_outputs_(ct_clamp->get_power_outputs(), measurement.power, energy_duration_ms, publish,
+                             frame.timestamp_ms);
+      if (publish && ct_clamp->is_line_pair()) {
         const float split_power = measurement.power * 0.5f;
         if (ct_clamp->get_power_split_line_a_sensor() != nullptr) {
           ct_clamp->get_power_split_line_a_sensor()->publish_state(split_power);
@@ -1146,19 +1357,24 @@ void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame) {
         }
       }
     } else {
-      ct_clamp->add_power_demand_sample(unavailable, demand_now_ms);
-      publish_power_outputs_(ct_clamp->get_power_outputs(), unavailable);
-      if (ct_clamp->get_power_split_line_a_sensor() != nullptr) {
+      if (!acquisition_timed) {
+        ct_clamp->add_power_demand_sample(unavailable, demand_now_ms);
+      }
+      publish_power_outputs_(ct_clamp->get_power_outputs(), unavailable, energy_duration_ms, publish,
+                             frame.timestamp_ms);
+      if (publish && ct_clamp->get_power_split_line_a_sensor() != nullptr) {
         ct_clamp->get_power_split_line_a_sensor()->publish_state(unavailable);
       }
-      if (ct_clamp->get_power_split_line_b_sensor() != nullptr) {
+      if (publish && ct_clamp->get_power_split_line_b_sensor() != nullptr) {
         ct_clamp->get_power_split_line_b_sensor()->publish_state(unavailable);
       }
     }
-    if (ct_clamp->get_current_sensor() != nullptr) {
+    if (publish && ct_clamp->get_current_sensor() != nullptr) {
       ct_clamp->get_current_sensor()->publish_state(measurement.has_current ? measurement.current : unavailable);
     }
-    ct_clamp->add_current_demand_sample(measurement.has_current ? measurement.current : unavailable, demand_now_ms);
+    if (!acquisition_timed) {
+      ct_clamp->add_current_demand_sample(measurement.has_current ? measurement.current : unavailable, demand_now_ms);
+    }
     if (ct_clamp->has_peak_analysis() && frame.transport == MeteringTransport::SPI && measurement.has_current &&
         frame.clamps[port].current_peak_valid) {
       const float current_scalar = port < 3 ? (775.0f / 42624.0f) : (775.0f / 170496.0f);
@@ -1178,34 +1394,41 @@ void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame) {
       ct_clamp->invalidate_peak(demand_now_ms);
     }
 
-    if (ct_clamp->get_apparent_power_sensor() != nullptr && measurement.has_apparent_power) {
+    if (publish && ct_clamp->get_apparent_power_sensor() != nullptr && measurement.has_apparent_power) {
       const bool above_threshold = measurement.apparent_power >= this->minimum_apparent_power_;
       ct_clamp->get_apparent_power_sensor()->publish_state(above_threshold ? measurement.apparent_power : 0.0f);
-    } else if (ct_clamp->get_apparent_power_sensor() != nullptr) {
+    } else if (publish && ct_clamp->get_apparent_power_sensor() != nullptr) {
       ct_clamp->get_apparent_power_sensor()->publish_state(unavailable);
     }
-    if (ct_clamp->get_power_factor_sensor() != nullptr && measurement.has_power_factor) {
+    if (publish && ct_clamp->get_power_factor_sensor() != nullptr && measurement.has_power_factor) {
       ct_clamp->get_power_factor_sensor()->publish_state(measurement.power_factor);
-    } else if (ct_clamp->get_power_factor_sensor() != nullptr) {
+    } else if (publish && ct_clamp->get_power_factor_sensor() != nullptr) {
       ct_clamp->get_power_factor_sensor()->publish_state(unavailable);
     }
-    if (ct_clamp->get_fundamental_current_sensor() != nullptr) {
+    if (publish && ct_clamp->get_fundamental_current_sensor() != nullptr) {
       ct_clamp->get_fundamental_current_sensor()->publish_state(
           has_fundamental_analysis ? measurement.fundamental_current : unavailable);
     }
-    if (ct_clamp->get_fundamental_reactive_power_sensor() != nullptr) {
+    if (this->prepare_ct_power_analysis_(frame, ct_clamp, &measurement)) {
+      ct_clamp->store_analysis_result(has_fundamental_analysis ? measurement.fundamental_reactive_power : unavailable,
+                                      has_fundamental_analysis ? measurement.fundamental_power_factor : unavailable,
+                                      has_fundamental_analysis ? measurement.displacement_angle : unavailable);
+    }
+    MeteringAnalysisTracker::Result analysis_result;
+    const bool publish_power_analysis = publish && ct_clamp->take_analysis_result(&analysis_result);
+    if (publish_power_analysis && ct_clamp->get_fundamental_reactive_power_sensor() != nullptr) {
       ct_clamp->get_fundamental_reactive_power_sensor()->publish_state(
-          has_fundamental_analysis ? measurement.fundamental_reactive_power : unavailable);
+          analysis_result.reactive_power);
     }
-    if (ct_clamp->get_fundamental_power_factor_sensor() != nullptr) {
+    if (publish_power_analysis && ct_clamp->get_fundamental_power_factor_sensor() != nullptr) {
       ct_clamp->get_fundamental_power_factor_sensor()->publish_state(
-          has_fundamental_analysis ? measurement.fundamental_power_factor : unavailable);
+          analysis_result.power_factor);
     }
-    if (ct_clamp->get_displacement_angle_sensor() != nullptr) {
+    if (publish_power_analysis && ct_clamp->get_displacement_angle_sensor() != nullptr) {
       ct_clamp->get_displacement_angle_sensor()->publish_state(
-          has_fundamental_analysis ? measurement.displacement_angle : unavailable);
+          analysis_result.displacement_angle);
     }
-    if (ct_clamp->get_current_thd_sensor() != nullptr) {
+    if (publish && ct_clamp->get_current_thd_sensor() != nullptr) {
       ct_clamp->get_current_thd_sensor()->publish_state(
           has_fundamental_analysis ? measurement.current_thd : unavailable);
     }
@@ -1218,11 +1441,20 @@ void EmporiaVueComponent::publish_metering_frame_(const MeteringFrame &frame) {
 
     float group_power = 0.0f;
     if (this->calculate_group_power_(frame, group, &group_power, calculation_generation)) {
-      group->add_power_demand_sample(group_power, demand_now_ms);
-      publish_power_outputs_(group->get_power_outputs(), group_power);
+      if (acquisition_timed) {
+        group->add_demand_interval(group_power, frame.duration_ms, demand_now_ms);
+      } else {
+        group->add_power_demand_sample(group_power, demand_now_ms);
+      }
+      publish_power_outputs_(group->get_power_outputs(), group_power, energy_duration_ms, publish, frame.timestamp_ms);
     } else {
-      group->add_power_demand_sample(NAN, demand_now_ms);
-      publish_power_outputs_(group->get_power_outputs(), std::numeric_limits<float>::quiet_NaN());
+      if (acquisition_timed) {
+        group->add_demand_interval(NAN, frame.duration_ms, demand_now_ms);
+      } else {
+        group->add_power_demand_sample(NAN, demand_now_ms);
+      }
+      publish_power_outputs_(group->get_power_outputs(), std::numeric_limits<float>::quiet_NaN(),
+                             energy_duration_ms, publish, frame.timestamp_ms);
     }
   }
 }

@@ -7,6 +7,7 @@ or use the ESPHome SPI path when you specifically want synchronized raw-waveform
 
 | Version | Changes |
 |---|---|
+| 2026.10.1 | Added optional SPI `analysis_interval` for duration-weighted P1/Q1 analysis of fundamental reactive power, power factor and displacement angle. Improved daily-energy precision and date-aware restore, stable energy/demand storage keys, acquisition-timed SPI aggregation, fractional RMS and Vue 3 UART reception/diagnostics. **One-time reset:** saved daily energy and daily demand maxima use a new storage format/key. Internal power filters no longer affect apparent power or physical PF. No required YAML changes. |
 | 2026.09.2 | Peak and crest factor now report `unknown` below the current threshold or for inconsistent measurements; sampled short peaks remain unfiltered. No YAML changes required. |
 | 2026.09.1 | **Breaking change:** `energy:` now converts to kWh automatically. Remove `multiply: 0.001` from local energy filters and `filter_defaults.energy`; it is no longer needed. See [Energy](#energy). Existing exact conversion filters are recognized to prevent double scaling. |
 | 2026.07.10 | Separated direction-aware line diagnostics from automatic line assignment and added import/export auto modes. |
@@ -259,6 +260,10 @@ For an unknown assignment, use [automatic line assignment](#automatic-line-assig
 `energy:` creates **Today's Energy**, not a lifetime total: it accumulates during the day and resets at midnight.
 The unit is kWh by default, and a `time:` source is required. For example, a constant 1,000 W load running for one
 hour adds 1 kWh. A visible `power:` sensor is not required.
+Internal accumulation uses double precision, so small increments remain measurable even at a high daily total.
+SPI integrates each accepted window's mean power over its measured duration, independently of display updates.
+For I2C, `method: left` (the default), `right`, or `trapezoid` selects integration between consecutive readings;
+this setting does not change SPI window integration.
 
 ```yaml
 cir1:
@@ -707,6 +712,7 @@ reduce the underlying calculation rate. When the fundamental voltage is unavaila
 emporiavue:
   minimum_apparent_power: 5VA
   minimum_fundamental_current: 20mA
+  analysis_interval: 10s
   peak_interval: 5s
 
   circuits:
@@ -761,6 +767,54 @@ Current THD                  unknown
 
 `minimum_fundamental_current` controls that boundary globally. `minimum_apparent_power` is the global cutoff for the
 existing apparent-power and total-power-factor outputs.
+
+#### A shared analysis interval
+
+For stable, consistent fundamental power analysis, set `analysis_interval` globally or on an individual main/circuit:
+
+```yaml
+emporiavue:
+  analysis_interval: 10s  # SPI-only; inherited by mains and circuits.
+
+  circuits:
+    cir2:
+      analysis_interval: 5s  # Optional override for this circuit.
+      fundamental_reactive_power:
+      fundamental_power_factor:
+      displacement_angle:
+
+    cir3:
+      analysis_interval: 0s  # Disable the inherited interval; report each metering window.
+      displacement_angle:
+```
+
+The component averages fundamental active power `P1` and reactive power `Q1`, weighted by the actual acquisition
+duration of each complete SPI measurement window. It then publishes the configured outputs together:
+
+- **Fundamental Reactive Power:** mean `Q1`.
+- **Displacement Angle:** `atan2(mean Q1, mean P1)`.
+- **Fundamental Power Factor:** `abs(mean P1) / hypot(mean P1, mean Q1)`.
+
+Angles near −180° and +180° therefore average near 180°, not 0°. Larger fundamental power contributes more to the
+resultant direction; this is not an arithmetic average of angle or power-factor readings, nor the total power factor.
+The current threshold is applied after P1/Q1 averaging, so readings fluctuating around the cutoff are not individually
+clipped first. If the resultant signal falls below `minimum_fundamental_current` (including cancellation), reactive
+power is `0 var`, and angle and fundamental power factor are `unknown`.
+
+The default is `0s`, preserving publication on every metering window. Supported intervals are 0 to 60 minutes.
+Only complete measurement windows contribute, so an enabled interval ends on the first complete window that reaches
+the requested acquisition duration (normally within about 220 ms during uninterrupted reception). Dropped frames do
+not count as measured time. Missing fundamental values, a metering timeout or a calibration/line change discard the
+unfinished analysis window. The last completed result stays visible while the next window is collected; before the
+first result, the entities are `unknown`. No analysis history is saved to flash.
+
+This setting affects **only** `fundamental_reactive_power`, `fundamental_power_factor`, and `displacement_angle`.
+Fundamental current, THD, peak, voltage phase angles, line detection, ordinary power and energy keep their existing
+behavior. Only configured entities are created.
+
+When using `analysis_interval`, remove `throttle_average` from these three entities and their `filter_defaults`
+entries: the averaging now happens before the derived values are calculated. Other ESPHome filters remain available.
+For fundamental current, THD and other scalar readings, normal display filters can still be used.
 
 `peak_interval` controls a separate time window for `current_peak` and `current_crest_factor`. The default is `5s`, and
 supported values are 1 to 60 seconds. Each complete SPI metering window is about 220 ms. During the peak interval, the
@@ -850,6 +904,7 @@ time:
 emporiavue:
   minimum_apparent_power: 5VA
   minimum_fundamental_current: 20mA
+  analysis_interval: 10s  # SPI-only: shared fundamental Q/PF/angle window.
   peak_interval: 5s
 
   filter_defaults:
@@ -861,9 +916,7 @@ emporiavue:
     power_apparent: [*fast_average]
     power_factor: [*fast_average]
     fundamental_current: [*fast_average]
-    fundamental_reactive_power: [*fast_average]
-    fundamental_power_factor: [*fast_average]
-    displacement_angle: [*analysis_average]
+    # Fundamental Q/PF/angle already share analysis_interval; do not average them again.
     current_thd: [*analysis_average]
     voltage_thd: [*analysis_average]
     energy:
@@ -1005,9 +1058,18 @@ SPI metering frames during the diagnostics interval; a rising `ESP SPI Processin
 had to be dropped because the processing queue was full. `ESP SPI Transfer Errors` separately counts receive-queue and
 DMA failures; it does not include processing overruns.
 
+`ESP SPI Metering Window Drops` counts completed windows lost to a full measurement journal, windows too old to use,
+and rejected incomplete metering windows. It is separate from raw SPI transfer/processing errors. The status log lists
+`metering_window_drops` and `metering_stale_windows` separately. A detected gap resets unfinished demand, peak and
+fundamental-analysis windows; already accumulated energy is retained.
+
 The SPI status log reports Vue 3 voltage-receiver failures separately as `voltage_errors`; these are not DMA failures.
-They mean the SAMD09 detected a malformed voltage telegram, a UART error, or voltage data that stayed stale beyond
-the permitted single-scan reuse. The affected SPI frame is still rejected.
+Before the first valid voltage telegram, affected frames are rejected. Afterwards the last valid voltages remain usable
+until a new valid telegram arrives, without an age timeout. With the updated Vue 3 SAMD09 image, diagnostics also expose
+`SAMD Voltage Telegrams`, `SAMD Voltage UART Errors`, `SAMD Voltage Rejected Telegrams`, and `SAMD Voltage Age` in ms.
+Increasing age means the readings are being held, not newly measured; investigate sustained increases before trusting
+voltage-dependent results. UART errors and malformed replacements do not erase an earlier valid snapshot. Older images
+without this metadata report these additional entities as `unknown`.
 With DEBUG logging enabled, the status line also appears immediately before every SPI recovery, even within the normal
 10-second logging interval. `received_frames` counts completed SPI transfers (including invalid or processing-dropped
 transfers); `valid_frames` counts frames accepted for metering. Both totals survive automatic recovery, including
@@ -1024,6 +1086,20 @@ Daily energy and daily demand maxima restore their last saved state by default. 
 protection: an unexpected power cut can lose changes made since the last save. Calibration and line choices are keyed
 by the logical main or circuit, such as `line_1` or `cir2`, so renaming it or moving its entities to a subdevice does not
 reset those settings.
+
+Energy and daily demand maxima also use stable logical keys, including the output direction for energy. Renaming a
+circuit or changing its subdevice does not change its storage identity. Saved energy includes its local date: same-day
+OTA restores it, while a restart after a missed midnight discards yesterday's total once valid time is available.
+Energy measured since boot before time synchronization is retained for the newly established day. This date is internal
+storage metadata only; it is not added to Home Assistant entity names, IDs, or sensor states. The first update to
+2026.10.1 resets saved daily energy and daily demand maxima once; calibration and line settings are unaffected.
+
+SPI reception and raw calculations remain in separate tasks. A bounded measurement journal retains completed windows
+while the main loop is briefly busy. Energy, demand, peaks and P1/Q1 analysis consume every usable window using its
+acquisition timing; only instantaneous display values may skip intermediate updates. The journal is sized for the normal
+freshness horizon, with a 96-window memory cap. Reception timestamps are captured at DMA completion, so a delayed
+receiver task does not collapse the windows' time spacing. A longer blockade cannot be made lossless with finite memory:
+discarded windows are counted explicitly rather than silently overwritten or filled with invented energy.
 
 If no valid metering frame arrives for 2 seconds (or three `metering_interval`s, whichever is longer), instantaneous
 measurements become unknown; display filters may delay this. Daily energy and daily maxima are retained, but missing
@@ -1125,6 +1201,11 @@ cir1:
   power:
 ```
 
+Apparent power remains calibrated `U_rms * I_rms`; ordinary power factor uses calibrated physical active power divided
+by that apparent power. Neither uses arbitrary circuit power filters. Use `voltage_calibration` and
+`current_calibration` to correct the physical measurements. Power factor is `unknown` below its apparent-power threshold,
+for nonfinite readings, or when active power materially exceeds apparent power.
+
 The fundamental analysis deliberately does not reuse arbitrary internal active-power filters. Applying a nonlinear
 filter independently to P1, Q1, and S1 would destroy the phasor relationship and could hide negative/capacitive Q.
 Normal display filters directly on the new sensor entities are supported.
@@ -1199,6 +1280,8 @@ PF    = abs(P) / S
 
 `P` is true active power from sample correlation, not an estimate from `U * I * cos(phi)`. Non-sinusoidal current is
 therefore included in total RMS, active power, apparent power, and total PF.
+SPI RMS keeps its fractional result in the shared metering frame instead of rounding down to the I2C integer format.
+This improves digital resolution, not the analog accuracy of the ADC or CTs.
 
 #### Cycle and phase reference
 
@@ -1208,20 +1291,15 @@ used for all voltage inputs and all 19 CT channels.
 
 The configured integer current delays compensate the ADC/multiplexer pipeline before the sample enters the common cycle
 analysis. They do not claim to correct the individual phase error of every physical CT.
-
-❗ **SAMD09 RAM headroom.** The SAMD09D14A has 4 KB of RAM and the SPI firmware already uses about 3,272 bytes
-of it, mostly the three 1 KB `SpiFrames` buffers, leaving roughly 820 bytes of stack. That is enough for the
-current build and very little more: adding as few as 16 bytes of `.bss` to a known-good image makes the firmware
-stop driving the SPI bus entirely (no transfers at all, `sample_counter` stays 0, and the ESP32 resets the SAMD
-every two seconds). Check `arm-none-eabi-size` output when changing the Vue 3 firmware, and free RAM first if a
-change needs new statics.
+The roughly 13.8 kB cycle ring is allocated only when waveform analysis needs it; I2C and SPI RMS/power-only setups do
+not reserve it.
 
 On Vue 3, the separate voltage controller sends UART telegrams independently of the SAMD09 current scans. Following
-the stock firmware's timing-efficient design, the UART interrupt only fills a six-byte mailbox; each ADC current scan
-then consumes and validates a completed set of three voltages. Partial telegrams remain intact across scan boundaries.
-One additional current scan may reuse the last validated set if no new telegram has completed; a longer gap is invalid.
-This bounds normal clock-slip handling to one scan (nominally 51 µs), without relaxing the SPI frame checks or changing
-the current sample rate. It does not phase-lock the two controllers or eliminate their sampling-time uncertainty.
+the stock firmware's timing-efficient design, the UART interrupt assembles six-byte telegrams and publishes only complete
+snapshots. Partial telegrams remain intact across ADC scan boundaries. The ADC handler validates a snapshot only when
+its generation changes and otherwise reuses the last valid voltages. Telegram counts, UART errors, rejected replacements
+and snapshot age are reported separately. This avoids losing updates when the controllers' independent clocks drift;
+it does not phase-lock them or eliminate their sampling-time uncertainty.
 
 #### Fundamental phasors
 
@@ -1295,7 +1373,9 @@ fundamental current phasor and therefore does not repair Q1 or the displacement 
 #### Accuracy limits
 
 The algorithms are tested with synthetic 50 Hz and 60 Hz waveforms, phase shifts, harmonic content, every mux alignment,
-all CT channels, and every line pair. Real-world absolute accuracy still depends on:
+all CT channels, and every line pair. End-to-end tests also pass raw SPI scans through the real delay alignment,
+phasor calculation, measurement journal and entity publication, including acquisition-timed energy integration.
+Real-world absolute accuracy still depends on:
 
 - voltage and current calibration;
 - physical CT gain, bandwidth, phase error, and orientation;

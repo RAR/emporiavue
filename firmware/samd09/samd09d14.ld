@@ -79,4 +79,7 @@ SECTIONS
   } > ram
 
   PROVIDE(_stack_top = __top_ram - 0);
+  /* Cortex-M0+ exception frames plus nested UART/DMAC/SPI handlers need
+     guaranteed headroom. Fail the build before static data consumes it. */
+  ASSERT(_ebss <= __top_ram - 256, "SAMD09 requires at least 256 bytes for stack")
 }

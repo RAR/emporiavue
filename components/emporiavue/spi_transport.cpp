@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <new>
 
 namespace esphome {
 namespace emporiavue {
@@ -78,24 +79,6 @@ static constexpr uint32_t SPI_CRC32_NIBBLE_TABLE[16] = {
     0x9B64C2B0UL, 0x86D3D2D4UL, 0xA00AE278UL, 0xBDBDF21CUL,
 };
 
-static uint32_t integer_sqrt_u64(uint64_t value) {
-  uint64_t result = 0;
-  uint64_t bit = uint64_t{1} << 62U;
-  while (bit > value) {
-    bit >>= 2U;
-  }
-  while (bit != 0) {
-    if (value >= result + bit) {
-      value -= result + bit;
-      result = (result >> 1U) + bit;
-    } else {
-      result >>= 1U;
-    }
-    bit >>= 2U;
-  }
-  return static_cast<uint32_t>(result);
-}
-
 static uint32_t squared_sample_count(uint32_t count) {
   return count * count;
 }
@@ -145,6 +128,7 @@ void EmporiaVueComponent::publish_spi_diagnostics_() {
   if (this->diag_adc_overruns_sensor_ != nullptr) {
     this->diag_adc_overruns_sensor_->publish_state(static_cast<float>(this->spi_rx_adc_overruns_));
   }
+  this->publish_spi_voltage_diagnostics_();
   if (this->diag_recoveries_sensor_ != nullptr &&
       (!this->spi_diag_recoveries_published_ ||
        this->spi_diag_published_recoveries_ != this->spi_rx_recoveries_)) {
@@ -177,6 +161,10 @@ void EmporiaVueComponent::publish_spi_diagnostics_() {
   }
   if (this->diag_spi_processing_overruns_sensor_ != nullptr) {
     this->diag_spi_processing_overruns_sensor_->publish_state(static_cast<float>(this->spi_processing_overruns_));
+  }
+  if (this->diag_spi_metering_window_drops_sensor_ != nullptr) {
+    this->diag_spi_metering_window_drops_sensor_->publish_state(
+        static_cast<float>(this->spi_metering_window_drops_ + this->spi_metering_stale_windows_));
   }
 
   const size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -217,6 +205,44 @@ void EmporiaVueComponent::publish_spi_diagnostics_() {
 #endif
 }
 
+EmporiaVueComponent::SpiVoltageDiagnostics EmporiaVueComponent::get_spi_voltage_diagnostics_() {
+#ifdef USE_ESP32
+  portENTER_CRITICAL(&this->spi_frame_error_lock_);
+#endif
+  const SpiVoltageDiagnostics diagnostics = this->spi_voltage_diagnostics_;
+#ifdef USE_ESP32
+  portEXIT_CRITICAL(&this->spi_frame_error_lock_);
+#endif
+  return diagnostics;
+}
+
+void EmporiaVueComponent::publish_spi_voltage_diagnostics_() {
+  if (this->diag_voltage_telegrams_sensor_ == nullptr && this->diag_voltage_uart_errors_sensor_ == nullptr &&
+      this->diag_voltage_rejected_telegrams_sensor_ == nullptr && this->diag_voltage_age_sensor_ == nullptr) {
+    return;
+  }
+  const SpiVoltageDiagnostics diagnostics = this->get_spi_voltage_diagnostics_();
+  const float unknown = std::numeric_limits<float>::quiet_NaN();
+  if (this->diag_voltage_telegrams_sensor_ != nullptr) {
+    this->diag_voltage_telegrams_sensor_->publish_state(
+        diagnostics.available ? static_cast<float>(diagnostics.accepted_telegrams) : unknown);
+  }
+  if (this->diag_voltage_uart_errors_sensor_ != nullptr) {
+    this->diag_voltage_uart_errors_sensor_->publish_state(
+        diagnostics.available ? static_cast<float>(diagnostics.uart_errors) : unknown);
+  }
+  if (this->diag_voltage_rejected_telegrams_sensor_ != nullptr) {
+    this->diag_voltage_rejected_telegrams_sensor_->publish_state(
+        diagnostics.available ? static_cast<float>(diagnostics.rejected_telegrams) : unknown);
+  }
+  if (this->diag_voltage_age_sensor_ != nullptr) {
+    this->diag_voltage_age_sensor_->publish_state(
+        diagnostics.available && diagnostics.voltage_valid
+            ? static_cast<float>(diagnostics.age_scans) * diagnostics.sample_period_ticks / 16000.0f
+            : unknown);
+  }
+}
+
 void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
   if (this->runtime_mode_ != RuntimeMode::SPI) {
     return;
@@ -226,12 +252,11 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
     return;
   }
 
-  this->configure_spi_analysis_requirements_();
-
 #ifdef USE_ESP32
   if (this->spi_receiver_started_) {
     return;
   }
+  this->configure_spi_analysis_requirements_();
 
   spi_bus_config_t bus_config{};
   bus_config.mosi_io_num = this->spi_data_pin_;
@@ -246,6 +271,7 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
   slave_config.flags = 0;
   slave_config.queue_size = SPI_RX_QUEUE_SIZE;
   slave_config.mode = 0;
+  slave_config.post_trans_cb = EmporiaVueComponent::spi_transaction_completed_;
 
   esp_err_t err = spi_slave_initialize(this->spi_host_, &bus_config, &slave_config, SPI_DMA_CH_AUTO);
   if (err != ESP_OK) {
@@ -287,9 +313,34 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
     }
     std::memset(this->spi_transactions_, 0, sizeof(this->spi_transactions_));
     this->spi_rx_inflight_ = 0;
+    this->spi_voltage_sample_ring_.reset();
   };
 
-  this->spi_metering_queue_ = xQueueCreate(1, sizeof(MeteringFrame));
+  // Allocate only for actual waveform consumers, once before the worker starts.
+  // I2C and SPI RMS/power-only configurations do not reserve this 13.5 KiB ring.
+  if (this->spi_waveform_analysis_required_) {
+    this->spi_voltage_sample_ring_.reset(new (std::nothrow) SpiFundamentalSample[SPI_VOLTAGE_SAMPLE_RING_SIZE]);
+    if (this->spi_voltage_sample_ring_ == nullptr) {
+      ESP_LOGE(TAG, "SAMD09 SPI waveform analysis buffer allocation failed");
+      cleanup_spi_init();
+      return;
+    }
+  } else {
+    this->spi_voltage_sample_ring_.reset();
+  }
+
+  // This is a measurement journal, not a latest-value display mailbox. Cover
+  // the valid freshness horizon, with bounded memory even for extreme YAML
+  // intervals. The main thread aggregates every entry and displays only the
+  // newest one. A full journal is an explicit measurement gap, never overwrite.
+  const float nominal_rate = SPI_SAMPLE_TIMEBASE_HZ / (this->hardware_id_ == 3 ? 816.0f : 632.0f);
+  const uint32_t target_samples = this->spi_metering_target_samples_();
+  const uint32_t minimum_window_samples = std::max<uint32_t>(600, target_samples - std::min<uint32_t>(350, target_samples));
+  const uint32_t minimum_window_ms =
+      std::max<uint32_t>(1, static_cast<uint32_t>(minimum_window_samples * 1000.0f / nominal_rate));
+  this->spi_metering_journal_capacity_ = static_cast<uint16_t>(
+      std::min<uint32_t>(96, this->metering_timeout_ms_ / minimum_window_ms + 2));
+  this->spi_metering_queue_ = xQueueCreate(this->spi_metering_journal_capacity_, sizeof(MeteringFrame));
   this->spi_processing_free_queue_ = xQueueCreate(SPI_PROCESSING_FRAME_COUNT, sizeof(SpiQueuedFrame *));
   this->spi_processing_ready_queue_ = xQueueCreate(SPI_PROCESSING_FRAME_COUNT, sizeof(SpiQueuedFrame *));
   if (this->spi_metering_queue_ == nullptr || this->spi_processing_free_queue_ == nullptr ||
@@ -347,6 +398,8 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
     this->spi_rx_sample_period_errors_ = 0;
     this->spi_rx_queue_errors_ = 0;
     this->spi_processing_overruns_ = 0;
+    this->spi_metering_window_drops_ = 0;
+    this->spi_metering_stale_windows_ = 0;
     this->spi_processing_busy_us_ = 0;
     this->spi_diag_last_processing_busy_us_ = 0;
     this->spi_processing_load_window_start_ms_ = millis();
@@ -369,6 +422,7 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
     this->spi_frame_error_log_pending_ = false;
   }
   this->spi_rx_last_flags_ = 0;
+  this->spi_voltage_diagnostics_ = SpiVoltageDiagnostics{};
   this->spi_rx_last_sample_counter_ = 0;
   this->spi_last_frame_samples_ = 0;
   this->spi_rx_invalid_streak_ = 0;
@@ -379,6 +433,8 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
   this->spi_rx_logged_crc_errors_ = this->spi_rx_crc_errors_;
   this->spi_rx_logged_queue_errors_ = this->spi_rx_queue_errors_;
   this->spi_rx_logged_processing_overruns_ = this->spi_processing_overruns_;
+  this->spi_rx_logged_metering_window_drops_ = this->spi_metering_window_drops_;
+  this->spi_rx_logged_metering_stale_windows_ = this->spi_metering_stale_windows_;
   this->spi_rx_logged_dma_errors_ = this->spi_rx_dma_errors_;
   this->spi_rx_logged_voltage_errors_ = this->spi_rx_voltage_errors_;
   this->spi_rx_logged_samd_overruns_ = this->spi_rx_samd_overruns_;
@@ -419,9 +475,10 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
 
   ESP_LOGI(TAG,
            "SAMD09 SPI pipeline started: clk=GPIO%d data=GPIO%d cs=GPIO%d frame_size=%u dma_queue=%u "
-           "processing_queue=%u",
+           "processing_queue=%u metering_journal=%u",
            this->spi_clk_pin_, this->spi_data_pin_, this->spi_frame_pin_, static_cast<unsigned>(SPI_RAW_FRAME_SIZE),
-           static_cast<unsigned>(SPI_RX_QUEUE_SIZE), static_cast<unsigned>(SPI_PROCESSING_FRAME_COUNT));
+           static_cast<unsigned>(SPI_RX_QUEUE_SIZE), static_cast<unsigned>(SPI_PROCESSING_FRAME_COUNT),
+           static_cast<unsigned>(this->spi_metering_journal_capacity_));
 #else
   ESP_LOGE(TAG, "SAMD09 SPI receiver requires ESP32");
 #endif
@@ -476,6 +533,9 @@ bool EmporiaVueComponent::stop_spi_receiver_() {
     return false;
   }
   if (this->spi_metering_queue_ != nullptr) {
+    // Producers have stopped. Preserve completed measurements before freeing
+    // the journal, including during a deliberate firmware backup/update.
+    this->publish_queued_spi_metering_();
     vQueueDelete(this->spi_metering_queue_);
     this->spi_metering_queue_ = nullptr;
   }
@@ -499,6 +559,8 @@ bool EmporiaVueComponent::stop_spi_receiver_() {
   }
   std::memset(this->spi_transactions_, 0, sizeof(this->spi_transactions_));
   this->spi_rx_inflight_ = 0;
+  // Both tasks have stopped, so no producer/consumer can still access the ring.
+  this->spi_voltage_sample_ring_.reset();
 #endif
   this->spi_receiver_started_ = false;
   this->spi_rx_last_valid_frame_ms_ = 0;
@@ -577,7 +639,9 @@ bool EmporiaVueComponent::queue_spi_receive_(uint8_t index) {
   std::memset(&this->spi_transactions_[index], 0, sizeof(this->spi_transactions_[index]));
   this->spi_transactions_[index].length = SPI_RAW_FRAME_SIZE * 8;
   this->spi_transactions_[index].rx_buffer = this->spi_rx_buffers_[index];
-  this->spi_transactions_[index].user = reinterpret_cast<void *>(static_cast<uintptr_t>(index));
+  this->spi_dma_slots_[index].index = index;
+  this->spi_dma_slots_[index].completed_ms = 0;
+  this->spi_transactions_[index].user = &this->spi_dma_slots_[index];
 
   const esp_err_t err = spi_slave_queue_trans(this->spi_host_, &this->spi_transactions_[index], 0);
   if (err != ESP_OK) {
@@ -593,6 +657,14 @@ bool EmporiaVueComponent::queue_spi_receive_(uint8_t index) {
 }
 
 #ifdef USE_ESP32
+void IRAM_ATTR EmporiaVueComponent::spi_transaction_completed_(spi_slave_transaction_t *transaction) {
+  // Called by the driver immediately after DMA completion, before queuing the
+  // result for the receive task. Keep this ISR callback bounded and IRAM-safe.
+  if (transaction != nullptr && transaction->user != nullptr) {
+    static_cast<SpiDmaSlot *>(transaction->user)->completed_ms = millis();
+  }
+}
+
 void EmporiaVueComponent::handoff_spi_transaction_(spi_slave_transaction_t *transaction) {
   if (transaction == nullptr) {
     return;
@@ -600,7 +672,9 @@ void EmporiaVueComponent::handoff_spi_transaction_(spi_slave_transaction_t *tran
   // Count every completed transfer, including zero-length transfers and frames
   // dropped by the processing queue. This distinguishes no RX from rejected RX.
   this->spi_rx_received_frames_ = this->spi_rx_received_frames_ + 1;
-  const auto index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(transaction->user));
+  const auto *slot = static_cast<const SpiDmaSlot *>(transaction->user);
+  const uint8_t index = slot->index;
+  const uint32_t completed_ms = slot->completed_ms;
   if (this->spi_rx_inflight_ > 0) {
     this->spi_rx_inflight_ = static_cast<uint16_t>(this->spi_rx_inflight_ - 1);
   }
@@ -611,6 +685,7 @@ void EmporiaVueComponent::handoff_spi_transaction_(spi_slave_transaction_t *tran
   if (this->spi_processing_free_queue_ != nullptr && this->spi_processing_ready_queue_ != nullptr &&
       xQueueReceive(this->spi_processing_free_queue_, &frame, 0) == pdTRUE && frame != nullptr) {
     frame->trans_len_bits = static_cast<uint16_t>(std::min<size_t>(transaction->trans_len, UINT16_MAX));
+    frame->received_ms = completed_ms;
     std::memcpy(frame->data, transaction->rx_buffer, SPI_RAW_FRAME_SIZE);
     if (xQueueSend(this->spi_processing_ready_queue_, &frame, 0) != pdTRUE) {
       this->spi_processing_overruns_ = this->spi_processing_overruns_ + 1;
@@ -635,6 +710,15 @@ void EmporiaVueComponent::process_spi_frame_(const SpiQueuedFrame &frame) {
   const uint32_t flags = validation.flags;
   const uint32_t sample_counter = validation.sample_counter;
   const uint16_t sample_period_ticks = validation.sample_period_ticks;
+  if (protocol_valid) {
+    // CRC covers the reserved bytes too. Never consume metadata from a damaged
+    // packet, or interpret old firmware's unspecified reserved bytes as totals.
+    const SpiVoltageDiagnostics diagnostics =
+        this->decode_spi_voltage_diagnostics_(frame.data, validation, this->hardware_id_);
+    portENTER_CRITICAL(&this->spi_frame_error_lock_);
+    this->spi_voltage_diagnostics_ = diagnostics;
+    portEXIT_CRITICAL(&this->spi_frame_error_lock_);
+  }
   if (protocol_valid && (flags & SPI_FRAME_FLAG_OVERRUN) != 0) {
     this->spi_rx_samd_overruns_++;
   }
@@ -670,6 +754,9 @@ void EmporiaVueComponent::process_spi_frame_(const SpiQueuedFrame &frame) {
     this->spi_sample_rate_hz_ = SPI_SAMPLE_TIMEBASE_HZ / static_cast<float>(sample_period_ticks);
     this->spi_rx_invalid_streak_ = 0;
     this->spi_rx_last_valid_frame_ms_ = millis();
+    this->spi_processing_received_ms_ = frame.received_ms;
+    this->spi_processing_last_counter_ = sample_counter + SPI_RAW_SCAN_COUNT - 1U;
+    this->spi_processing_time_anchor_valid_ = true;
     this->decode_spi_raw_frame_(frame.data, sequence, flags, sample_counter);
   } else {
     if (samd_sample_error) {
@@ -728,6 +815,36 @@ void EmporiaVueComponent::process_spi_frame_(const SpiQueuedFrame &frame) {
 
 void EmporiaVueComponent::spi_rx_task_trampoline_(void *arg) {
   static_cast<EmporiaVueComponent *>(arg)->spi_rx_task_();
+}
+
+EmporiaVueComponent::SpiVoltageDiagnostics EmporiaVueComponent::decode_spi_voltage_diagnostics_(
+    const uint8_t *frame, const SpiFrameValidationResult &validation, uint16_t hardware_id) {
+  SpiVoltageDiagnostics diagnostics{};
+  if (frame == nullptr || hardware_id != 3 || validation.error != SpiFrameValidationError::NONE ||
+      validation.version != SPI_VUE3_RAW_FRAME_VERSION || validation.type != SPI_VUE3_RAW_FRAME_TYPE) {
+    return diagnostics;
+  }
+  const auto reserved_byte = [frame](uint8_t index) {
+    return frame[SPI_RAW_FRAME_HEADER_SIZE + index * SPI_RAW_SCAN_SIZE + SPI_RAW_SCAN_SIZE - 1];
+  };
+  const auto reserved_word = [&reserved_byte](uint8_t index) {
+    return static_cast<uint32_t>(reserved_byte(index)) |
+           (static_cast<uint32_t>(reserved_byte(index + 1)) << 8) |
+           (static_cast<uint32_t>(reserved_byte(index + 2)) << 16) |
+           (static_cast<uint32_t>(reserved_byte(index + 3)) << 24);
+  };
+  // EVUD v1 is a capability marker, independent of the unchanged frame version.
+  if (reserved_word(16) != 0x44555645UL || reserved_byte(20) != 1) {
+    return diagnostics;
+  }
+  diagnostics.accepted_telegrams = reserved_word(0);
+  diagnostics.uart_errors = reserved_word(4);
+  diagnostics.rejected_telegrams = reserved_word(8);
+  diagnostics.age_scans = reserved_word(12);
+  diagnostics.sample_period_ticks = validation.sample_period_ticks;
+  diagnostics.available = true;
+  diagnostics.voltage_valid = (validation.flags & SPI_FRAME_FLAG_VOLTAGE_ERROR) == 0;
+  return diagnostics;
 }
 
 void EmporiaVueComponent::spi_rx_task_() {
@@ -879,12 +996,13 @@ void EmporiaVueComponent::log_spi_frame_validation_error_(const SpiFrameValidati
 }
 
 void EmporiaVueComponent::reset_spi_metering_state_() {
+  ++this->spi_metering_acquisition_epoch_;
   this->spi_metering_accumulator_ = SpiMeteringAccumulator{};
   this->spi_metering_window_synced_ = false;
   std::memset(this->spi_raw_scan_ring_, 0, sizeof(this->spi_raw_scan_ring_));
   this->spi_raw_scan_ring_index_ = 0;
   this->spi_raw_scan_ring_count_ = 0;
-  std::memset(this->spi_voltage_sample_ring_, 0, sizeof(this->spi_voltage_sample_ring_));
+  // Ring contents need no clearing: count/index delimit initialized samples.
   this->spi_voltage_sample_ring_index_ = 0;
   this->spi_voltage_sample_ring_count_ = 0;
   this->spi_voltage_sample_ring_last_counter_ = 0;
@@ -920,19 +1038,15 @@ int16_t EmporiaVueComponent::sanitize_spi_adc_offset_(int32_t average) {
   return static_cast<int16_t>(average);
 }
 
-uint16_t EmporiaVueComponent::scale_spi_rms_(uint64_t sum, uint32_t numerator, uint32_t denominator) {
+float EmporiaVueComponent::scale_spi_rms_(uint64_t sum, uint32_t numerator, uint32_t denominator) {
   if (denominator == 0 || numerator == 0 || sum == 0) {
     return 0;
   }
-  if (sum > UINT64_MAX / numerator) {
-    return UINT16_MAX;
-  }
-  const uint64_t scaled = (sum * numerator) / denominator;
-  const uint32_t root = integer_sqrt_u64(scaled);
-  if (root >= UINT16_MAX) {
-    return UINT16_MAX;
-  }
-  return static_cast<uint16_t>(root);
+  // Centering is exact in the integer accumulator. Convert only here, once per
+  // completed window, and keep fractional RMS rather than flooring it to the
+  // I2C integer representation (which biased small currents and their THD).
+  const double scaled = static_cast<double>(sum) * numerator / denominator;
+  return static_cast<float>(std::sqrt(scaled));
 }
 
 int32_t EmporiaVueComponent::scale_spi_power_(int64_t raw, uint32_t multiplier, uint32_t denominator) {
@@ -1335,6 +1449,7 @@ void EmporiaVueComponent::decode_spi_raw_frame_(const uint8_t *frame, uint32_t s
       }
       // Drop the rest of this raw frame and reacquire alignment/crossings on
       // the next frame. Never publish a partially synchronized measurement.
+      this->spi_metering_window_drops_ = this->spi_metering_window_drops_ + 1U;
       this->reset_spi_metering_state_();
       return;
     }
@@ -1544,6 +1659,7 @@ void EmporiaVueComponent::process_spi_raw_scan_(uint8_t current_index) {
   }
 
   acc.sample_count++;
+  this->spi_last_accumulated_counter_ = static_cast<uint32_t>(scan.sample_counter);
 }
 
 void EmporiaVueComponent::finish_spi_metering_window_(uint32_t sequence, uint32_t flags) {
@@ -1555,34 +1671,6 @@ void EmporiaVueComponent::finish_spi_metering_window_(uint32_t sequence, uint32_
 
   const uint32_t min_cycle_count = std::max<uint32_t>(2, static_cast<uint32_t>(acc.line1_period_count) / 2U);
   const uint32_t min_mux_samples = std::max<uint32_t>(8, acc.sample_count / 32U);
-  bool phase_required[3]{false, false, false};
-  auto mark_phase_required = [&phase_required](const MeteringPhaseConfig *phase) {
-    if (phase != nullptr && phase->get_input_wire() < 3) {
-      phase_required[phase->get_input_wire()] = true;
-    }
-  };
-  for (const auto *phase : this->metering_phases_) {
-    mark_phase_required(phase);
-  }
-  for (const auto *ct_clamp : this->metering_ct_clamps_) {
-    if (ct_clamp == nullptr) {
-      continue;
-    }
-    mark_phase_required(ct_clamp->get_phase());
-    if (ct_clamp->is_line_pair()) {
-      mark_phase_required(ct_clamp->get_line_pair_phase_b());
-    }
-  }
-  for (const auto *virtual_line : this->metering_virtual_lines_) {
-    if (virtual_line == nullptr) {
-      continue;
-    }
-    mark_phase_required(virtual_line->get_line_a());
-    mark_phase_required(virtual_line->get_line_b());
-  }
-  if (phase_required[1] || phase_required[2]) {
-    phase_required[0] = true;
-  }
 
   const char *invalid_reason = nullptr;
   uint32_t min_observed_mux_samples = std::numeric_limits<uint32_t>::max();
@@ -1604,7 +1692,7 @@ void EmporiaVueComponent::finish_spi_metering_window_(uint32_t sequence, uint32_
     invalid_reason = "short sample window";
   } else if (this->spi_sample_rate_hz_ <= 1.0f) {
     invalid_reason = "missing sample rate";
-  } else if (phase_required[0] && acc.cycle_count[0] < min_cycle_count) {
+  } else if (acc.cycle_count[0] < min_cycle_count) {
     invalid_reason = "missing line 1 cycles";
   }
 
@@ -1644,6 +1732,9 @@ void EmporiaVueComponent::finish_spi_metering_window_(uint32_t sequence, uint32_
                sample_rate_tenths % 10U);
       this->spi_invalid_window_last_log_ms_ = now;
     }
+    // Do not let later accepted windows bridge this rejected measurement.
+    ++this->spi_metering_acquisition_epoch_;
+    this->spi_metering_window_drops_ = this->spi_metering_window_drops_ + 1U;
     this->spi_metering_accumulator_ = SpiMeteringAccumulator{};
     return;
   }
@@ -1706,8 +1797,16 @@ void EmporiaVueComponent::finish_spi_metering_window_(uint32_t sequence, uint32_
   MeteringFrame frame{};
   frame.schema_version = 1;
   frame.transport = MeteringTransport::SPI;
-  frame.sequence = sequence;
-  frame.timestamp_ms = millis();
+  frame.sequence = ++this->spi_metering_window_sequence_;
+  frame.acquisition_epoch = this->spi_metering_acquisition_epoch_;
+  // Anchor to reception, not delayed worker execution. Locate this window's
+  // last sample within the received raw frame using the SAMD sample counter.
+  const uint32_t trailing_samples = this->spi_processing_last_counter_ - this->spi_last_accumulated_counter_;
+  frame.timestamp_ms = this->spi_processing_time_anchor_valid_
+                           ? this->spi_processing_received_ms_ -
+                                 static_cast<uint32_t>(trailing_samples * 1000.0f / sample_rate)
+                           : millis();
+  frame.duration_ms = static_cast<float>(acc.sample_count) * 1000.0f / sample_rate;
   frame.valid = true;
   frame.quality_flags = static_cast<uint8_t>(flags & 0xFFU);
   const uint32_t main_sample_count_squared = squared_sample_count(acc.sample_count);
@@ -1906,7 +2005,9 @@ void EmporiaVueComponent::finish_spi_metering_window_(uint32_t sequence, uint32_
 
 #ifdef USE_ESP32
   if (this->spi_metering_queue_ != nullptr) {
-    xQueueOverwrite(this->spi_metering_queue_, &frame);
+    if (xQueueSend(this->spi_metering_queue_, &frame, 0) != pdTRUE) {
+      this->spi_metering_window_drops_ = this->spi_metering_window_drops_ + 1U;
+    }
   }
 #endif
   this->spi_metering_accumulator_ = SpiMeteringAccumulator{};
@@ -1918,8 +2019,18 @@ void EmporiaVueComponent::publish_queued_spi_metering_() {
     return;
   }
   MeteringFrame frame{};
-  while (xQueueReceive(this->spi_metering_queue_, &frame, 0) == pdTRUE) {
-    this->submit_metering_frame_(frame);
+  // Bound work to the entries present at loop entry. Do not chase a producer
+  // indefinitely or replay sensor callbacks for every historical window.
+  const UBaseType_t pending = uxQueueMessagesWaiting(this->spi_metering_queue_);
+  for (UBaseType_t index = 0; index < pending; ++index) {
+    if (xQueueReceive(this->spi_metering_queue_, &frame, 0) != pdTRUE) {
+      break;
+    }
+    if (millis() - frame.timestamp_ms > this->metering_timeout_ms_) {
+      ++this->spi_metering_stale_windows_;
+      continue;
+    }
+    this->submit_metering_frame_(frame, index + 1U == pending);
   }
 #endif
 }
@@ -1927,18 +2038,25 @@ void EmporiaVueComponent::publish_queued_spi_metering_() {
 void EmporiaVueComponent::log_spi_receiver_status_(bool force) {
 #ifdef USE_ESP32
   const uint32_t now = millis();
+  const SpiVoltageDiagnostics voltage = this->get_spi_voltage_diagnostics_();
+  const bool voltage_status_changed =
+      voltage.available != this->spi_rx_logged_voltage_diagnostics_available_ ||
+      voltage.uart_errors != this->spi_rx_logged_voltage_uart_errors_ ||
+      voltage.rejected_telegrams != this->spi_rx_logged_voltage_rejected_telegrams_;
   const bool status_changed =
       !this->spi_rx_logged_status_valid_ || this->spi_rx_sync_errors_ != this->spi_rx_logged_sync_errors_ ||
       this->spi_rx_crc_errors_ != this->spi_rx_logged_crc_errors_ ||
       this->spi_rx_queue_errors_ != this->spi_rx_logged_queue_errors_ ||
       this->spi_processing_overruns_ != this->spi_rx_logged_processing_overruns_ ||
+      this->spi_metering_window_drops_ != this->spi_rx_logged_metering_window_drops_ ||
+      this->spi_metering_stale_windows_ != this->spi_rx_logged_metering_stale_windows_ ||
       this->spi_rx_dma_errors_ != this->spi_rx_logged_dma_errors_ ||
       this->spi_rx_voltage_errors_ != this->spi_rx_logged_voltage_errors_ ||
       this->spi_rx_samd_overruns_ != this->spi_rx_logged_samd_overruns_ ||
       this->spi_rx_adc_overruns_ != this->spi_rx_logged_adc_overruns_ ||
       this->spi_rx_frame_gaps_ != this->spi_rx_logged_frame_gaps_ ||
       this->spi_rx_recoveries_ != this->spi_rx_logged_recoveries_ ||
-      this->spi_rx_last_flags_ != this->spi_rx_logged_flags_;
+      this->spi_rx_last_flags_ != this->spi_rx_logged_flags_ || voltage_status_changed;
   if (force || (status_changed && now - this->spi_rx_last_log_ms_ >= METERING_STATUS_LOG_INTERVAL_MS)) {
     this->spi_rx_last_log_ms_ = now;
     const UBaseType_t processing_pending = this->spi_processing_ready_queue_ == nullptr
@@ -1949,7 +2067,8 @@ void EmporiaVueComponent::log_spi_receiver_status_(bool force) {
              " frame_errors=%" PRIu32 " startup_errors=%" PRIu32
              " runtime_errors=%" PRIu32 " length=%" PRIu32 " header=%" PRIu32 " payload=%" PRIu32
              " crc=%" PRIu32 " period=%" PRIu32 " queue_errors=%" PRIu32
-             " processing_overruns=%" PRIu32 " processing_pending=%u dma_errors=%" PRIu32
+             " processing_overruns=%" PRIu32 " processing_pending=%u metering_window_drops=%" PRIu32
+             " metering_stale_windows=%" PRIu32 " dma_errors=%" PRIu32
              " voltage_errors=%" PRIu32
              " samd_overruns=%" PRIu32 " adc_overruns=%" PRIu32 " seq_gaps=%" PRIu32 " recoveries=%" PRIu32
              " inflight=%" PRIu16 " flags=0x%04" PRIx32 " sample_counter=%" PRIu32,
@@ -1958,19 +2077,34 @@ void EmporiaVueComponent::log_spi_receiver_status_(bool force) {
              this->spi_rx_crc_errors_, this->spi_rx_transfer_length_errors_, this->spi_rx_header_errors_,
              this->spi_rx_payload_length_errors_, this->spi_rx_crc_mismatch_errors_,
              this->spi_rx_sample_period_errors_, this->spi_rx_queue_errors_, this->spi_processing_overruns_,
-             static_cast<unsigned>(processing_pending), this->spi_rx_dma_errors_, this->spi_rx_voltage_errors_,
+             static_cast<unsigned>(processing_pending), this->spi_metering_window_drops_,
+             this->spi_metering_stale_windows_, this->spi_rx_dma_errors_, this->spi_rx_voltage_errors_,
              this->spi_rx_samd_overruns_,
              this->spi_rx_adc_overruns_, this->spi_rx_frame_gaps_, this->spi_rx_recoveries_, this->spi_rx_inflight_,
              this->spi_rx_last_flags_, this->spi_rx_last_sample_counter_);
+    if (voltage.available && (force || voltage_status_changed)) {
+      ESP_LOGD(TAG,
+               "SAMD09 voltage UART status: accepted=%" PRIu32 " uart_errors=%" PRIu32
+               " rejected=%" PRIu32 " age_ms=%.1f (raw counters since SAMD reset)",
+               voltage.accepted_telegrams, voltage.uart_errors, voltage.rejected_telegrams,
+               voltage.voltage_valid
+                   ? static_cast<float>(voltage.age_scans) * voltage.sample_period_ticks / 16000.0f
+                   : std::numeric_limits<float>::quiet_NaN());
+    }
     this->spi_rx_logged_status_valid_ = true;
     this->spi_rx_logged_sync_errors_ = this->spi_rx_sync_errors_;
     this->spi_rx_logged_crc_errors_ = this->spi_rx_crc_errors_;
     this->spi_rx_logged_queue_errors_ = this->spi_rx_queue_errors_;
     this->spi_rx_logged_processing_overruns_ = this->spi_processing_overruns_;
+    this->spi_rx_logged_metering_window_drops_ = this->spi_metering_window_drops_;
+    this->spi_rx_logged_metering_stale_windows_ = this->spi_metering_stale_windows_;
     this->spi_rx_logged_dma_errors_ = this->spi_rx_dma_errors_;
     this->spi_rx_logged_voltage_errors_ = this->spi_rx_voltage_errors_;
     this->spi_rx_logged_samd_overruns_ = this->spi_rx_samd_overruns_;
     this->spi_rx_logged_adc_overruns_ = this->spi_rx_adc_overruns_;
+    this->spi_rx_logged_voltage_diagnostics_available_ = voltage.available;
+    this->spi_rx_logged_voltage_uart_errors_ = voltage.uart_errors;
+    this->spi_rx_logged_voltage_rejected_telegrams_ = voltage.rejected_telegrams;
     this->spi_rx_logged_frame_gaps_ = this->spi_rx_frame_gaps_;
     this->spi_rx_logged_recoveries_ = this->spi_rx_recoveries_;
     this->spi_rx_logged_flags_ = this->spi_rx_last_flags_;

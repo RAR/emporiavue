@@ -51,6 +51,7 @@ from esphome.const import (
     UNIT_BYTES,
     UNIT_DEGREES,
     UNIT_HERTZ,
+    UNIT_MILLISECOND,
     UNIT_PERCENT,
     UNIT_VOLT,
     UNIT_WATT,
@@ -125,6 +126,10 @@ CONF_DIAG_FRAME_ERRORS = "diag_frame_errors"
 CONF_DIAG_TRANSFER_ERRORS = "diag_transfer_errors"
 CONF_DIAG_FRAME_OVERRUNS = "diag_frame_overruns"
 CONF_DIAG_ADC_OVERRUNS = "diag_adc_overruns"
+CONF_DIAG_VOLTAGE_TELEGRAMS = "diag_voltage_telegrams"
+CONF_DIAG_VOLTAGE_UART_ERRORS = "diag_voltage_uart_errors"
+CONF_DIAG_VOLTAGE_REJECTED_TELEGRAMS = "diag_voltage_rejected_telegrams"
+CONF_DIAG_VOLTAGE_AGE = "diag_voltage_age"
 CONF_DIAG_RECOVERIES = "diag_recoveries"
 CONF_DIAG_LAST_FRAME_SAMPLES = "diag_last_frame_samples"
 CONF_DIAG_SAMPLE_RATE = "diag_sample_rate"
@@ -134,6 +139,7 @@ CONF_DIAG_LOOP_STACK_FREE = "diag_loop_stack_free"
 CONF_DIAG_SPI_STACK_FREE = "diag_spi_stack_free"
 CONF_DIAG_SPI_PROCESSING_LOAD = "diag_spi_processing_load"
 CONF_DIAG_SPI_PROCESSING_OVERRUNS = "diag_spi_processing_overruns"
+CONF_DIAG_SPI_METERING_WINDOW_DROPS = "diag_spi_metering_window_drops"
 CONF_DIAG_RESTART_REASON = "diag_restart_reason"
 CONF_FIRMWARE_VERSION = "firmware_version"
 CONF_BUNDLED_FIRMWARE_VERSION = "bundled_firmware_version"
@@ -153,6 +159,7 @@ CONF_MINIMUM_APPARENT_POWER = "minimum_apparent_power"
 CONF_MINIMUM_FUNDAMENTAL_CURRENT = "minimum_fundamental_current"
 CONF_DEMAND_INTERVAL = "demand_interval"
 CONF_PEAK_INTERVAL = "peak_interval"
+CONF_ANALYSIS_INTERVAL = "analysis_interval"
 CONF_LINE_DETECTION = "line_detection"
 CONF_LINE_DETECTION_DIRECTION = "_line_detection_direction"
 CONF_LINE_SELECT = "line_select"
@@ -404,6 +411,14 @@ SPI_RUNTIME_DIAGNOSTIC_ENTITY_NAMES = {
     CONF_DIAG_SPI_STACK_FREE: "ESP SPI Minimum Free Stack",
     CONF_DIAG_SPI_PROCESSING_LOAD: "ESP SPI Processing Load",
     CONF_DIAG_SPI_PROCESSING_OVERRUNS: "ESP SPI Processing Overruns",
+    CONF_DIAG_SPI_METERING_WINDOW_DROPS: "ESP SPI Metering Window Drops",
+}
+
+VUE3_SPI_DIAGNOSTIC_ENTITY_NAMES = {
+    CONF_DIAG_VOLTAGE_TELEGRAMS: "SAMD Voltage Telegrams",
+    CONF_DIAG_VOLTAGE_UART_ERRORS: "SAMD Voltage UART Errors",
+    CONF_DIAG_VOLTAGE_REJECTED_TELEGRAMS: "SAMD Voltage Rejected Telegrams",
+    CONF_DIAG_VOLTAGE_AGE: "SAMD Voltage Age",
 }
 
 
@@ -411,6 +426,8 @@ def _diagnostic_entity_names(config):
     names = dict(DIAGNOSTIC_ENTITY_NAMES)
     if config.get(CONF_MODE, MODE_I2C) == MODE_SPI:
         names.update(SPI_RUNTIME_DIAGNOSTIC_ENTITY_NAMES)
+        if config.get(CONF_HARDWARE) == HARDWARE_VUE3:
+            names.update(VUE3_SPI_DIAGNOSTIC_ENTITY_NAMES)
     return names
 
 
@@ -2090,6 +2107,13 @@ def _validate_peak_interval(value):
     return value
 
 
+def _validate_analysis_interval(value):
+    value = cv.positive_time_period_milliseconds(value)
+    if value.total_milliseconds > 3600000:
+        raise cv.Invalid("analysis_interval must be between 0s and 60min")
+    return value
+
+
 def _validate_gpio_number(value):
     if isinstance(value, str):
         normalized = value.strip().upper()
@@ -2214,6 +2238,7 @@ METERING_MAIN_SCHEMA = cv.Schema(
         cv.Optional(CONF_FUNDAMENTAL_POWER_FACTOR): POWER_FACTOR_SENSOR_SCHEMA,
         cv.Optional(CONF_DISPLACEMENT_ANGLE): DISPLACEMENT_ANGLE_SENSOR_SCHEMA,
         cv.Optional(CONF_CURRENT_THD): CURRENT_THD_SENSOR_SCHEMA,
+        cv.Optional(CONF_ANALYSIS_INTERVAL): _validate_analysis_interval,
         cv.Optional(CONF_PEAK_INTERVAL): _validate_peak_interval,
         cv.Optional(CONF_CURRENT_PEAK): CURRENT_PEAK_SENSOR_SCHEMA,
         cv.Optional(CONF_CURRENT_CREST_FACTOR): CURRENT_CREST_FACTOR_SENSOR_SCHEMA,
@@ -2316,6 +2341,7 @@ METERING_CIRCUIT_SCHEMA = cv.Schema(
         cv.Optional(CONF_FUNDAMENTAL_POWER_FACTOR): POWER_FACTOR_SENSOR_SCHEMA,
         cv.Optional(CONF_DISPLACEMENT_ANGLE): DISPLACEMENT_ANGLE_SENSOR_SCHEMA,
         cv.Optional(CONF_CURRENT_THD): CURRENT_THD_SENSOR_SCHEMA,
+        cv.Optional(CONF_ANALYSIS_INTERVAL): _validate_analysis_interval,
         cv.Optional(CONF_PEAK_INTERVAL): _validate_peak_interval,
         cv.Optional(CONF_CURRENT_PEAK): CURRENT_PEAK_SENSOR_SCHEMA,
         cv.Optional(CONF_CURRENT_CREST_FACTOR): CURRENT_CREST_FACTOR_SENSOR_SCHEMA,
@@ -2410,6 +2436,8 @@ def _validate_metering_topology(config):
     source_keys = set(circuits.keys()) | set(mains.keys()) | set(groups.keys())
 
     if config[CONF_MODE] != MODE_SPI:
+        if config[CONF_ANALYSIS_INTERVAL].total_milliseconds != 0:
+            raise cv.Invalid("analysis_interval is only supported in SPI mode")
         analysis_nodes = [
             *((f"mains.{key}", node) for key, node in mains.items()),
             *((f"circuits.{key}", node) for key, node in circuits.items()),
@@ -2417,6 +2445,8 @@ def _validate_metering_topology(config):
             *((f"ct_clamps[{index}]", node) for index, node in enumerate(config.get(CONF_CT_CLAMPS, []))),
         ]
         for path, node in analysis_nodes:
+            if node.get(CONF_ANALYSIS_INTERVAL, config[CONF_ANALYSIS_INTERVAL]).total_milliseconds != 0:
+                raise cv.Invalid(f"{path}.analysis_interval is only supported in SPI mode")
             for key in SPI_ANALYSIS_SENSOR_KEYS:
                 if key in node:
                     raise cv.Invalid(f"{path}.{key} is only supported in SPI mode")
@@ -2718,6 +2748,7 @@ METERING_CT_CLAMP_SCHEMA = cv.Schema(
         cv.Optional(CONF_FUNDAMENTAL_POWER_FACTOR): POWER_FACTOR_SENSOR_SCHEMA,
         cv.Optional(CONF_DISPLACEMENT_ANGLE): DISPLACEMENT_ANGLE_SENSOR_SCHEMA,
         cv.Optional(CONF_CURRENT_THD): CURRENT_THD_SENSOR_SCHEMA,
+        cv.Optional(CONF_ANALYSIS_INTERVAL): _validate_analysis_interval,
         cv.Optional(CONF_PEAK_INTERVAL): _validate_peak_interval,
         cv.Optional(CONF_CURRENT_PEAK): CURRENT_PEAK_SENSOR_SCHEMA,
         cv.Optional(CONF_CURRENT_CREST_FACTOR): CURRENT_CREST_FACTOR_SENSOR_SCHEMA,
@@ -2757,6 +2788,7 @@ EMPORIAVUE_SCHEMA = cv.Schema(
         cv.Optional(CONF_METERING_INTERVAL, default="220ms"): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_DEMAND_INTERVAL, default="15min"): _validate_demand_interval,
         cv.Optional(CONF_PEAK_INTERVAL, default="5s"): _validate_peak_interval,
+        cv.Optional(CONF_ANALYSIS_INTERVAL, default="0s"): _validate_analysis_interval,
         cv.Optional(CONF_MINIMUM_APPARENT_POWER, default="5VA"): _validate_volt_amps,
         cv.Optional(CONF_MINIMUM_FUNDAMENTAL_CURRENT, default="20mA"): _validate_amperes,
         cv.Optional(CONF_LINE_DETECTION, default={}): LINE_DETECTION_GLOBAL_SCHEMA,
@@ -2819,6 +2851,31 @@ EMPORIAVUE_SCHEMA = cv.Schema(
             icon="mdi:alert-circle-outline",
             state_class=STATE_CLASS_MEASUREMENT,
             accuracy_decimals=0,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_DIAG_VOLTAGE_TELEGRAMS): sensor.sensor_schema(
+            icon="mdi:counter",
+            state_class=STATE_CLASS_MEASUREMENT,
+            accuracy_decimals=0,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_DIAG_VOLTAGE_UART_ERRORS): sensor.sensor_schema(
+            icon="mdi:alert-circle-outline",
+            state_class=STATE_CLASS_MEASUREMENT,
+            accuracy_decimals=0,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_DIAG_VOLTAGE_REJECTED_TELEGRAMS): sensor.sensor_schema(
+            icon="mdi:alert-circle-outline",
+            state_class=STATE_CLASS_MEASUREMENT,
+            accuracy_decimals=0,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_DIAG_VOLTAGE_AGE): sensor.sensor_schema(
+            unit_of_measurement=UNIT_MILLISECOND,
+            icon="mdi:timer-outline",
+            state_class=STATE_CLASS_MEASUREMENT,
+            accuracy_decimals=1,
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
         cv.Optional(CONF_DIAG_RECOVERIES): sensor.sensor_schema(
@@ -2884,6 +2941,12 @@ EMPORIAVUE_SCHEMA = cv.Schema(
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
         cv.Optional(CONF_DIAG_SPI_PROCESSING_OVERRUNS): sensor.sensor_schema(
+            icon="mdi:alert-circle-outline",
+            state_class=STATE_CLASS_MEASUREMENT,
+            accuracy_decimals=0,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_DIAG_SPI_METERING_WINDOW_DROPS): sensor.sensor_schema(
             icon="mdi:alert-circle-outline",
             state_class=STATE_CLASS_MEASUREMENT,
             accuracy_decimals=0,
@@ -2955,7 +3018,7 @@ def _power_sensor_config_without_output_keys(config):
     return config
 
 
-async def _new_energy_sensor(config, parent_sensor, timeout_ms):
+async def _new_energy_sensor(config, parent_sensor, timeout_ms, preference_path, external_integration):
     energy_sensor = await sensor.new_sensor(config)
     await cg.register_component(energy_sensor, config)
     cg.add(energy_sensor.set_parent(parent_sensor))
@@ -2965,25 +3028,36 @@ async def _new_energy_sensor(config, parent_sensor, timeout_ms):
     cg.add(energy_sensor.set_method(config[CONF_METHOD]))
     cg.add(energy_sensor.set_energy_scale(ENERGY_UNIT_SCALES[config[CONF_UNIT_OF_MEASUREMENT]]))
     cg.add(energy_sensor.set_max_sample_gap(timeout_ms))
+    cg.add(energy_sensor.set_preference_key(_metering_preference_key(preference_path)))
+    cg.add(energy_sensor.set_external_integration(external_integration))
     return energy_sensor
 
 
-async def _add_power_outputs(var, power_configs, timeout_ms):
+async def _add_power_outputs(var, power_configs, timeout_ms, metering_path, external_integration):
     for power_config in power_configs or []:
         raw_sensor = await sensor.new_sensor(power_config[CONF_RAW_POWER])
         visible_sensor = await sensor.new_sensor(_power_sensor_config_without_output_keys(power_config))
+        energy_sensor = cg.nullptr
+        if energy_config := power_config.get(CONF_ENERGY):
+            energy_sensor = await _new_energy_sensor(
+                energy_config,
+                raw_sensor,
+                timeout_ms,
+                f"{metering_path}.energy.{power_config[CONF_DIRECTION]}",
+                external_integration,
+            )
         cg.add(
             var.add_power_output(
                 POWER_DIRECTION_IDS[power_config[CONF_DIRECTION]],
                 raw_sensor,
                 visible_sensor,
+                energy_sensor,
             )
         )
-        if energy_config := power_config.get(CONF_ENERGY):
-            await _new_energy_sensor(energy_config, raw_sensor, timeout_ms)
 
 
-async def _add_fundamental_analysis_sensors(var, config):
+async def _add_fundamental_analysis_sensors(var, config, default_interval):
+    cg.add(var.set_analysis_interval(config.get(CONF_ANALYSIS_INTERVAL, default_interval)))
     sensor_setters = (
         (CONF_FUNDAMENTAL_CURRENT, var.set_fundamental_current_sensor),
         (CONF_FUNDAMENTAL_REACTIVE_POWER, var.set_fundamental_reactive_power_sensor),
@@ -2997,7 +3071,7 @@ async def _add_fundamental_analysis_sensors(var, config):
             cg.add(setter(sens))
 
 
-async def _add_demand_sensors(var, config, default_interval, include_current=True):
+async def _add_demand_sensors(var, config, default_interval, metering_path, include_current=True):
     cg.add(var.set_demand_interval(config.get(CONF_DEMAND_INTERVAL, default_interval)))
 
     if sensor_config := config.get(CONF_POWER_DEMAND):
@@ -3009,6 +3083,9 @@ async def _add_demand_sensors(var, config, default_interval, include_current=Tru
         time_ = await cg.get_variable(sensor_config[CONF_TIME_ID])
         cg.add(var.set_power_demand_time(time_))
         cg.add(var.set_power_demand_restore(sensor_config[CONF_RESTORE]))
+        cg.add(var.set_power_demand_preference_key(
+            _metering_preference_key(f"{metering_path}.maximum_power_demand")
+        ))
 
     if not include_current:
         return
@@ -3021,6 +3098,9 @@ async def _add_demand_sensors(var, config, default_interval, include_current=Tru
         time_ = await cg.get_variable(sensor_config[CONF_TIME_ID])
         cg.add(var.set_current_demand_time(time_))
         cg.add(var.set_current_demand_restore(sensor_config[CONF_RESTORE]))
+        cg.add(var.set_current_demand_preference_key(
+            _metering_preference_key(f"{metering_path}.maximum_current_demand")
+        ))
 
 
 async def _add_peak_sensors(var, config, default_interval):
@@ -3152,6 +3232,18 @@ async def to_code(config):
     if diag_adc_overruns_config := config.get(CONF_DIAG_ADC_OVERRUNS):
         sens = await sensor.new_sensor(diag_adc_overruns_config)
         cg.add(var.set_diag_adc_overruns_sensor(sens))
+    if diag_voltage_telegrams_config := config.get(CONF_DIAG_VOLTAGE_TELEGRAMS):
+        sens = await sensor.new_sensor(diag_voltage_telegrams_config)
+        cg.add(var.set_diag_voltage_telegrams_sensor(sens))
+    if diag_voltage_uart_errors_config := config.get(CONF_DIAG_VOLTAGE_UART_ERRORS):
+        sens = await sensor.new_sensor(diag_voltage_uart_errors_config)
+        cg.add(var.set_diag_voltage_uart_errors_sensor(sens))
+    if diag_voltage_rejected_config := config.get(CONF_DIAG_VOLTAGE_REJECTED_TELEGRAMS):
+        sens = await sensor.new_sensor(diag_voltage_rejected_config)
+        cg.add(var.set_diag_voltage_rejected_telegrams_sensor(sens))
+    if diag_voltage_age_config := config.get(CONF_DIAG_VOLTAGE_AGE):
+        sens = await sensor.new_sensor(diag_voltage_age_config)
+        cg.add(var.set_diag_voltage_age_sensor(sens))
     if diag_recoveries_config := config.get(CONF_DIAG_RECOVERIES):
         sens = await sensor.new_sensor(diag_recoveries_config)
         cg.add(var.set_diag_recoveries_sensor(sens))
@@ -3184,6 +3276,9 @@ async def to_code(config):
     ):
         sens = await sensor.new_sensor(diag_spi_processing_overruns_config)
         cg.add(var.set_diag_spi_processing_overruns_sensor(sens))
+    if diag_spi_metering_window_drops_config := config.get(CONF_DIAG_SPI_METERING_WINDOW_DROPS):
+        sens = await sensor.new_sensor(diag_spi_metering_window_drops_config)
+        cg.add(var.set_diag_spi_metering_window_drops_sensor(sens))
 
     phases = []
     ct_clamps = []
@@ -3240,7 +3335,10 @@ async def to_code(config):
         )
         await _add_internal_power_filters(ct_clamp_var, main_config.get(CONF_FILTERS))
         await _add_current_calibration(ct_clamp_var, main_config, f"mains.{phase_key}")
-        await _add_power_outputs(ct_clamp_var, main_config.get(CONF_POWER), var.get_metering_timeout())
+        await _add_power_outputs(
+            ct_clamp_var, main_config.get(CONF_POWER), var.get_metering_timeout(),
+            f"mains.{phase_key}", config[CONF_MODE] == MODE_SPI,
+        )
         if current_config := main_config.get(CONF_CURRENT):
             sens = await sensor.new_sensor(current_config)
             cg.add(ct_clamp_var.set_current_sensor(sens))
@@ -3250,8 +3348,10 @@ async def to_code(config):
         if power_factor_config := main_config.get(CONF_POWER_FACTOR):
             sens = await sensor.new_sensor(power_factor_config)
             cg.add(ct_clamp_var.set_power_factor_sensor(sens))
-        await _add_fundamental_analysis_sensors(ct_clamp_var, main_config)
-        await _add_demand_sensors(ct_clamp_var, main_config, config[CONF_DEMAND_INTERVAL])
+        await _add_fundamental_analysis_sensors(ct_clamp_var, main_config, config[CONF_ANALYSIS_INTERVAL])
+        await _add_demand_sensors(
+            ct_clamp_var, main_config, config[CONF_DEMAND_INTERVAL], f"mains.{phase_key}"
+        )
         await _add_peak_sensors(ct_clamp_var, main_config, config[CONF_PEAK_INTERVAL])
         ct_clamps.append(ct_clamp_var)
         power_source_ct_clamps_by_key[phase_key] = ct_clamp_var
@@ -3273,7 +3373,10 @@ async def to_code(config):
             ct_clamp_var, circuit_config, f"circuits.{circuit_key}"
         )
 
-        await _add_power_outputs(ct_clamp_var, circuit_config.get(CONF_POWER), var.get_metering_timeout())
+        await _add_power_outputs(
+            ct_clamp_var, circuit_config.get(CONF_POWER), var.get_metering_timeout(),
+            f"circuits.{circuit_key}", config[CONF_MODE] == MODE_SPI,
+        )
         if current_config := circuit_config.get(CONF_CURRENT):
             sens = await sensor.new_sensor(current_config)
             cg.add(ct_clamp_var.set_current_sensor(sens))
@@ -3283,8 +3386,10 @@ async def to_code(config):
         if power_factor_config := circuit_config.get(CONF_POWER_FACTOR):
             sens = await sensor.new_sensor(power_factor_config)
             cg.add(ct_clamp_var.set_power_factor_sensor(sens))
-        await _add_fundamental_analysis_sensors(ct_clamp_var, circuit_config)
-        await _add_demand_sensors(ct_clamp_var, circuit_config, config[CONF_DEMAND_INTERVAL])
+        await _add_fundamental_analysis_sensors(ct_clamp_var, circuit_config, config[CONF_ANALYSIS_INTERVAL])
+        await _add_demand_sensors(
+            ct_clamp_var, circuit_config, config[CONF_DEMAND_INTERVAL], f"circuits.{circuit_key}"
+        )
         await _add_peak_sensors(ct_clamp_var, circuit_config, config[CONF_PEAK_INTERVAL])
         if power_split_config := circuit_config.get(CONF_POWER_SPLIT):
             line_a_key = _power_split_line_key(line_config[0])
@@ -3415,7 +3520,10 @@ async def to_code(config):
             ct_clamp_var, ct_config, f"legacy_ct_clamps.{ct_config[CONF_INPUT]}"
         )
 
-        await _add_power_outputs(ct_clamp_var, ct_config.get(CONF_POWER), var.get_metering_timeout())
+        await _add_power_outputs(
+            ct_clamp_var, ct_config.get(CONF_POWER), var.get_metering_timeout(),
+            f"legacy_ct_clamps.{ct_config[CONF_INPUT]}", config[CONF_MODE] == MODE_SPI,
+        )
         if current_config := ct_config.get(CONF_CURRENT):
             sens = await sensor.new_sensor(current_config)
             cg.add(ct_clamp_var.set_current_sensor(sens))
@@ -3425,8 +3533,10 @@ async def to_code(config):
         if power_factor_config := ct_config.get(CONF_POWER_FACTOR):
             sens = await sensor.new_sensor(power_factor_config)
             cg.add(ct_clamp_var.set_power_factor_sensor(sens))
-        await _add_fundamental_analysis_sensors(ct_clamp_var, ct_config)
-        await _add_demand_sensors(ct_clamp_var, ct_config, config[CONF_DEMAND_INTERVAL])
+        await _add_fundamental_analysis_sensors(ct_clamp_var, ct_config, config[CONF_ANALYSIS_INTERVAL])
+        await _add_demand_sensors(
+            ct_clamp_var, ct_config, config[CONF_DEMAND_INTERVAL], f"legacy_ct_clamps.{ct_config[CONF_INPUT]}"
+        )
         await _add_peak_sensors(ct_clamp_var, ct_config, config[CONF_PEAK_INTERVAL])
 
         ct_clamps.append(ct_clamp_var)
@@ -3450,9 +3560,12 @@ async def to_code(config):
             else:
                 cg.add(group_var.add_group_term(group_vars_by_key[source_key], sign))
         await _add_internal_power_filters(group_var, group_config.get(CONF_FILTERS))
-        await _add_power_outputs(group_var, group_config.get(CONF_POWER), var.get_metering_timeout())
+        await _add_power_outputs(
+            group_var, group_config.get(CONF_POWER), var.get_metering_timeout(),
+            f"groups.{group_key}", config[CONF_MODE] == MODE_SPI,
+        )
         await _add_demand_sensors(
-            group_var, group_config, config[CONF_DEMAND_INTERVAL], include_current=False
+            group_var, group_config, config[CONF_DEMAND_INTERVAL], f"groups.{group_key}", include_current=False
         )
     if groups:
         cg.add(var.set_metering_groups(groups))

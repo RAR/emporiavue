@@ -337,7 +337,16 @@ volatile bool SpiTxAwaitingComplete = false;
 #ifdef EMPORIAVUE_TARGET_VUE3
 volatile uint8_t VoltagePacketBuild[6];
 volatile uint8_t VoltagePacketBuildLength = 0;
-volatile bool VoltagePacketError = false;
+volatile uint8_t VoltagePacketPublished[6];
+volatile uint32_t VoltagePacketGeneration = 0;
+volatile uint32_t VoltageUartErrors = 0;
+uint32_t VoltagePacketConsumedGeneration = 0;
+uint32_t VoltageTelegramUpdates = 0;
+uint32_t VoltageRejectedTelegrams = 0;
+uint32_t VoltageAgeScans = 0;
+// Once acquired, keep the last validated voltage snapshot until a newer valid
+// UART telegram replaces it.
+bool VoltageValuesValid = false;
 int16_t DecodedVoltage[3];
 #endif
 
@@ -433,6 +442,29 @@ static uint32_t crc32_hardware_end(void)
 	return crc;
 }
 
+#ifdef EMPORIAVUE_TARGET_VUE3
+static void write_vue3_voltage_diagnostics(struct SpiRawFrame* frame)
+{
+	// Optional protocol-v2 extension in previously zero reserved scan bytes.
+	// Decode only with the EVUD marker and format version 1. Old receivers ignore
+	// these bytes; frame length, header version and CRC coverage are unchanged.
+	const uint32_t counters[4] = {
+		VoltageTelegramUpdates, VoltageUartErrors, VoltageRejectedTelegrams, VoltageAgeScans
+	};
+	for (uint8_t counter = 0; counter < 4; counter++)
+	{
+		const uint32_t value = counters[counter];
+		for (uint8_t byte = 0; byte < 4; byte++)
+			frame->scans[counter * 4 + byte].reserved = (uint8_t) (value >> (byte * 8));
+	}
+	frame->scans[16].reserved = 'E';
+	frame->scans[17].reserved = 'V';
+	frame->scans[18].reserved = 'U';
+	frame->scans[19].reserved = 'D';
+	frame->scans[20].reserved = 1;
+}
+#endif
+
 static void finalize_spi_frame(void)
 {
 	struct SpiRawFrame* frame = &SpiFrames[SpiBuildFrameIndex];
@@ -444,6 +476,7 @@ static void finalize_spi_frame(void)
 #ifdef EMPORIAVUE_TARGET_VUE3
 	// Protocol v2 carries the measured scan period in flag bits 3..14.
 	frame->header.flags = (uint16_t) (SpiPendingFlags | (SPI_SAMPLE_PERIOD_TICKS << 3));
+	write_vue3_voltage_diagnostics(frame);
 #else
 	frame->header.flags = SpiPendingFlags;
 #endif
@@ -693,42 +726,47 @@ void irq_handler_sercom0(void)
 		REG_SERCOM0_STATUS = USART_STATUS_RX_ERRORS;
 		REG_SERCOM0_INTFLAG = SERCOM_INT_ERROR;
 		VoltagePacketBuildLength = 0;
-		// The higher-priority UART ISR must not modify SpiPendingFlags:
-		// the ADC handler consumes this latch and reports VOLTAGE_ERROR.
-		VoltagePacketError = true;
+		// A receive error does not invalidate an earlier complete telegram or
+		// the last accepted voltage. Report it independently of sample validity.
+		VoltageUartErrors++;
 		return;
 	}
 	if ((REG_SERCOM0_INTFLAG & SERCOM_INT_RXC) == 0)
 		return;
 	const uint8_t value = (uint8_t) REG_SERCOM0_DATA;
 
-	// The Vue 3 voltage controller emits fixed six-byte telegrams. The DMA
-	// completion handler consumes and resets this buffer, as in stock firmware.
-	if (VoltagePacketBuildLength > 5)
-		return;
+	// Only this ISR owns partial reception. ADC boundaries must never discard
+	// a telegram that is still arriving from the independently clocked source.
 	if (VoltagePacketBuildLength == 0 && (value & 0xC0U) != 0xC0U)
 		return;
 
 	VoltagePacketBuild[VoltagePacketBuildLength++] = value;
+	if (VoltagePacketBuildLength == 6)
+	{
+		for (uint8_t index = 0; index < 6; index++)
+			VoltagePacketPublished[index] = VoltagePacketBuild[index];
+		__asm__ __volatile__("dmb sy" ::: "memory");
+		VoltagePacketGeneration++;
+		VoltagePacketBuildLength = 0;
+	}
 }
 
 static bool decode_vue3_voltage_packet(void)
 {
 	uint8_t packet[6];
-	// Take only a short snapshot with interrupts masked. Otherwise a UART
-	// error could reset and overwrite the buffer while it is being decoded.
+	// Most current scans need no work here. Copy a completed telegram only
+	// when its generation changed; validation runs once per consumed telegram.
 	const uint32_t primask = spi_enter_critical();
-	const bool valid = VoltagePacketBuildLength == 6 && !VoltagePacketError;
-	if (valid)
+	const uint32_t generation = VoltagePacketGeneration;
+	if (generation == VoltagePacketConsumedGeneration)
 	{
-		for (uint8_t index = 0; index < 6; index++)
-			packet[index] = VoltagePacketBuild[index];
+		spi_exit_critical(primask);
+		return VoltageValuesValid;
 	}
-	VoltagePacketBuildLength = 0;
-	VoltagePacketError = false;
+	for (uint8_t index = 0; index < 6; index++)
+		packet[index] = VoltagePacketPublished[index];
+	VoltagePacketConsumedGeneration = generation;
 	spi_exit_critical(primask);
-	if (!valid)
-		return false;
 
 	uint8_t phases_seen = 0;
 	int16_t decoded[3] = {0, 0, 0};
@@ -737,8 +775,11 @@ static bool decode_vue3_voltage_packet(void)
 		const uint8_t first = packet[pair * 2];
 		const uint8_t second = packet[pair * 2 + 1];
 		const uint8_t phase = second >> 6;
-		if (phase >= 3 || (phases_seen & (1U << phase)) != 0)
-			return false;
+		if ((first & 0xC0U) != 0xC0U || phase >= 3 || (phases_seen & (1U << phase)) != 0)
+		{
+			VoltageRejectedTelegrams++;
+			return VoltageValuesValid;
+		}
 		int16_t value = (int16_t) ((((uint16_t) first & 0x3FU) << 6) | (second & 0x3FU));
 		if ((value & 0x0800) != 0)
 			value = (int16_t) (value | 0xF000);
@@ -746,15 +787,29 @@ static bool decode_vue3_voltage_packet(void)
 		phases_seen |= (uint8_t) (1U << phase);
 	}
 	if (phases_seen != 0x07)
-		return false;
+	{
+		VoltageRejectedTelegrams++;
+		return VoltageValuesValid;
+	}
 	for (uint8_t phase = 0; phase < 3; phase++)
 		DecodedVoltage[phase] = decoded[phase];
+	VoltageValuesValid = true;
+	VoltageTelegramUpdates++;
+	VoltageAgeScans = 0;
 	return true;
 }
 #endif
 
 static void finish_spi_tx(void);
 void adc_config(void);
+
+static void prepare_adc_scan_start(void)
+{
+	// The logical first mux must match the GPIOs before conversions begin.
+	REG_PORT_OUT = (REG_PORT_OUT & ~0x1030000UL) | outputpinTable[0];
+	// The reference was just configured; the first conversion is not usable.
+	DiscardNextAdcScan = true;
+}
 
 static void enable_adc_dma(void)
 {
@@ -848,12 +903,10 @@ static void handle_adc_dma_interrupt(uint8_t flags)
 	enable_adc_dma();
 
 #ifdef EMPORIAVUE_TARGET_VUE3
-	// The voltage controller and the SAMD scan clock are independent, so a
-	// telegram that straddles a scan boundary is dropped by the reassembly above.
-	// Stock firmware simply keeps the previous voltages for that one scan; do the
-	// same instead of flagging the whole 56-scan SPI frame. Keeping this a plain
-	// call adds no static RAM (see the headroom note in the README).
-	(void) decode_vue3_voltage_packet();
+	if (VoltageValuesValid && VoltageAgeScans != 0xFFFFFFFFUL)
+		VoltageAgeScans++;
+	if (!decode_vue3_voltage_packet())
+		SpiPendingFlags |= SPI_FLAG_VOLTAGE_ERROR;
 #endif
 	capture_spi_scan(lastindex, Muxnr);
 
@@ -1307,6 +1360,7 @@ int main(void)
 	set_boot_stage(BOOT_STAGE_TC1_CONFIGURED);
 	configureNestedVectoredInterruptController();
 	set_boot_stage(BOOT_STAGE_NVIC_CONFIGURED);
+	prepare_adc_scan_start();
 	enable_adc_dma();
 	set_boot_stage(BOOT_STAGE_DMA_ENABLED);
 	enableADC ();

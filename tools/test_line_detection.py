@@ -78,8 +78,8 @@ struct Fixture {
     const float a=(real_line-1)*2.f*3.14159265358979323846f/3.f;
     frame.clamps[3].current_fundamental_i_raw=(p*std::cos(a)-q*std::sin(a))/230.f*170496.f/775.f;
     frame.clamps[3].current_fundamental_q_raw=(p*std::sin(a)+q*std::cos(a))/230.f*170496.f/775.f;
-    simulated_ms+=1; component.update_line_detection_(frame,&ct);
-    simulated_ms+=10000; component.update_line_detection_(frame,&ct);
+    simulated_ms+=1; frame.timestamp_ms=simulated_ms; component.update_line_detection_(frame,&ct);
+    simulated_ms+=10000; frame.timestamp_ms=simulated_ms; component.update_line_detection_(frame,&ct);
   }
   void hold(float p,float q,float current,int windows=4,uint8_t line=1) {
     for(int i=0;i<windows;i++) window(p,q,current,line);

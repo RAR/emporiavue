@@ -42,7 +42,7 @@ def component_fields(*bodies):
     members = sorted(set(re.findall(r"this->(\w+_)(?!\w|\()", "\n".join(bodies))))
     fields = []
     for name in members:
-        match = re.search(r"^  [^\n]*\b" + name + r"\b[^\n]*;", HEADER, re.M)
+        match = re.search(r"^  [A-Za-z_][^\n{}]*\b" + name + r"\b[^\n]*;", HEADER, re.M)
         assert match, name
         fields.append(match.group())
     return "\n".join(fields)
@@ -56,6 +56,7 @@ PRELUDE = r"""
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
 #include <cstdio>
 #include <cassert>
@@ -77,9 +78,11 @@ def test_spi_windows():
                "decode_spi_raw_frame_", "process_spi_raw_scan_", "finish_spi_metering_window_"]
     bodies = [function(SPI, "EmporiaVueComponent::" + name) for name in methods]
     declarations = [body[:body.index("{")].replace("EmporiaVueComponent::", "").rstrip() + ";" for body in bodies]
-    queue_marker = "#ifdef USE_ESP32\n  if (this->spi_metering_queue_"
-    assert queue_marker in bodies[-1]
-    bodies[-1] = bodies[-1].replace(queue_marker, "output.push_back(frame);\ncounts.push_back(acc.sample_count);\n" + queue_marker)
+    reset_marker = "  this->spi_metering_accumulator_ = SpiMeteringAccumulator{};\n}"
+    assert bodies[-1].endswith(reset_marker)
+    bodies[-1] = bodies[-1][:-len(reset_marker)] + (
+        "assert(frame.duration_ms > 0 && std::isfinite(frame.duration_ms));\n"
+        "output.push_back(frame);\ncounts.push_back(acc.sample_count);\n" + reset_marker)
     structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  enum MemSize")]
     fields = HEADER[HEADER.index("  SpiMeteringAccumulator spi_metering_accumulator_"):HEADER.index("  volatile uint16_t spi_rx_inflight_")]
     constants = HEADER[HEADER.index("static constexpr float VUE2_STOCK_CYCLE"):HEADER.index("class MeteringPhaseConfig;")]
@@ -197,6 +200,9 @@ using portMUX_TYPE = int;
   SpiFrameValidationResult validate_spi_frame_(const uint8_t*, uint16_t) {return next;}
   void decode_spi_raw_frame_(const uint8_t*, uint32_t, uint32_t, uint32_t) {++decoded;}
   void reset_spi_metering_state_() {++resets;}
+  SpiVoltageDiagnostics decode_spi_voltage_diagnostics_(const uint8_t*, const SpiFrameValidationResult&, uint16_t) {
+    return {};
+  }
   void process_spi_frame_(const SpiQueuedFrame&);
 """
     tests = r"""
@@ -245,9 +251,18 @@ def test_spi_status_logging():
     assert restart.index("this->log_spi_receiver_status_(true)") < restart.index("this->stop_spi_receiver_()")
     # Neither diagnostic total may be erased by soft recovery or a SAMD reset.
     assert "spi_rx_received_frames_ =" not in restart and "spi_rx_valid_frames_ =" not in restart
+    assert "spi_metering_window_drops_ =" not in restart and "spi_metering_stale_windows_ =" not in restart
+    setup = function(SPI, "EmporiaVueComponent::setup_spi_receiver_")
+    for counter in ("spi_metering_window_drops_", "spi_metering_stale_windows_"):
+        assignment = f"this->{counter} = 0;"
+        assert setup.count(assignment) == 1
+        assert setup.index("if (reset_statistics) {") < setup.index(assignment) < setup.index("this->spi_rx_last_flags_ = 0;")
+    assert "metering_journal=%u" in setup
     fields = component_fields(status, handoff)
-    frame = HEADER[HEADER.index("  struct SpiQueuedFrame {"):HEADER.index("  enum class SpiFrameValidationError")]
+    frame = HEADER[HEADER.index("  struct SpiDmaSlot {"):HEADER.index("  enum class SpiFrameValidationError")]
     frame = frame.replace("#endif", "")
+    voltage_struct = HEADER[HEADER.index("  struct SpiVoltageDiagnostics {"):
+                            HEADER.index("  struct SpiFundamentalSample {")]
     constants = "\n".join(re.findall(
         r"^[ \t]*static constexpr[^\n]*(?:SPI_RAW_FRAME_SIZE|METERING_STATUS_LOG_INTERVAL_MS)[^\n]*;", HEADER, re.M))
     mocks = r"""
@@ -279,6 +294,8 @@ struct spi_slave_transaction_t {void *user; size_t trans_len; const void *rx_buf
 """
     methods = r"""
   unsigned requeued{0};
+  SpiVoltageDiagnostics voltage;
+  SpiVoltageDiagnostics get_spi_voltage_diagnostics_() {return voltage;}
   bool queue_spi_receive_(uint8_t index) {assert(index==0); ++requeued; return true;}
   void handoff_spi_transaction_(spi_slave_transaction_t*);
   void log_spi_receiver_status_(bool force=false);
@@ -290,10 +307,12 @@ int main() {
   c.spi_processing_free_queue_=&free; c.spi_processing_ready_queue_=&ready;
   EmporiaVueComponent::SpiQueuedFrame output;
   uint8_t bytes[SPI_RAW_FRAME_SIZE]{};
-  spi_slave_transaction_t transaction{nullptr,0,bytes};
+  EmporiaVueComponent::SpiDmaSlot slot; slot.completed_ms=123; slot.index=0;
+  spi_slave_transaction_t transaction{&slot,0,bytes};
   c.handoff_spi_transaction_(nullptr); assert(c.spi_rx_received_frames_==0);
   free.item=&output; c.handoff_spi_transaction_(&transaction);
   assert(c.spi_rx_received_frames_==1 && output.trans_len_bits==0);
+  assert(output.received_ms==123);
   transaction.trans_len=8192;
   c.handoff_spi_transaction_(&transaction); // Queue exhausted, still a received transfer.
   assert(c.spi_rx_received_frames_==2 && c.spi_processing_overruns_==1);
@@ -322,11 +341,30 @@ int main() {
   assert(messages.back().find("voltage_errors=2")!=std::string::npos);
   c.spi_processing_ready_queue_=nullptr; c.log_spi_receiver_status_(true);
   assert(messages.back().find("processing_pending=0")!=std::string::npos);
+  c.voltage.available=true; c.voltage.voltage_valid=true;
+  c.voltage.accepted_telegrams=123; c.voltage.uart_errors=4;
+  c.voltage.rejected_telegrams=5; c.voltage.age_scans=10; c.voltage.sample_period_ticks=816;
+  c.log_spi_receiver_status_(true);
+  assert(messages.back().find("accepted=123 uart_errors=4 rejected=5 age_ms=0.5")!=std::string::npos);
+  messages.clear(); simulated_ms+=10000; ++c.voltage.accepted_telegrams;
+  c.log_spi_receiver_status_(); assert(messages.empty()); // Normal UART progress remains quiet.
+  ++c.voltage.uart_errors; c.log_spi_receiver_status_(); assert(messages.size()==2);
+  assert(messages.back().find("uart_errors=5")!=std::string::npos);
+  ++c.voltage.rejected_telegrams; c.log_spi_receiver_status_(); assert(messages.size()==2);
+  simulated_ms+=10000; c.log_spi_receiver_status_(); assert(messages.size()==4);
+  messages.clear(); simulated_ms+=10000;
+  const auto transfer_errors=c.spi_rx_queue_errors_+c.spi_rx_dma_errors_;
+  c.spi_metering_window_drops_=2; c.log_spi_receiver_status_(); assert(messages.size()==1);
+  assert(messages.back().find("metering_window_drops=2 metering_stale_windows=0")!=std::string::npos);
+  simulated_ms+=10000; c.spi_metering_stale_windows_=3; c.log_spi_receiver_status_();
+  assert(messages.size()==2);
+  assert(messages.back().find("metering_window_drops=2 metering_stale_windows=3")!=std::string::npos);
+  assert(c.spi_rx_queue_errors_+c.spi_rx_dma_errors_==transfer_errors);
   std::puts("PASS SPI status: RX/drop counters, forced recovery snapshots, unchanged/healthy throttling");
 }
 """
     compile_run(PRELUDE + mocks + constants + "\nclass EmporiaVueComponent {public:\n" +
-                frame + fields + methods + "};\n" + status + handoff + tests)
+                frame + voltage_struct + fields + methods + "};\n" + status + handoff + tests)
 
 
 def test_current_peak_preservation():
@@ -387,9 +425,12 @@ struct MeteringFrame {MeteringTransport transport{MeteringTransport::SPI};};
 struct MeteringCTMeasurement {
   bool has_current{false}; float current{0}; bool has_fundamental_analysis{false};
   float fundamental_current{0}, fundamental_reactive_power{0};
+  float fundamental_active_power{0}, fundamental_voltage{0};
   float fundamental_power_factor{NAN}, displacement_angle{NAN}, current_thd{NAN};
 };
 struct MeteringCTClampConfig {
+  uint32_t get_analysis_interval() const {return 0;}
+  bool has_fundamental_power_analysis() const {return true;}
   sensor::Sensor reactive, factor, angle, thd;
   bool want_reactive{true}, want_factor{true}, want_angle{true}, want_thd{true};
   sensor::Sensor *get_fundamental_reactive_power_sensor() const {return want_reactive ? const_cast<sensor::Sensor*>(&reactive) : nullptr;}
@@ -436,18 +477,40 @@ int main() {
 
 
 def test_energy_gaps():
-    methods = ["setup", "dump_config", "publish_state_and_save", "schedule_midnight_reset_", "process_metering_state_"]
+    methods = ["setup", "dump_config", "publish_state_and_save", "check_day_", "add_integral_wh",
+               "interval_duration_today_ms_", "interval_energy_wh",
+               "schedule_midnight_reset_", "process_metering_state_"]
     bodies = "\n".join(function(METERING, "MeteringDailyEnergy::" + name) for name in methods)
     energy_class = HEADER[HEADER.index("enum class MeteringEnergyMethod"):HEADER.index("class MeteringPowerFilters")]
     energy_class = energy_class.replace("protected:", "public:").replace("time::", "mock_time::")
     mocks = r"""
+#include <map>
+#include <sys/time.h>
 #define LOG_SENSOR(...) ((void)0)
+time_t simulated_wall_seconds=1;
+long simulated_wall_microseconds=0;
+int mock_gettimeofday(struct timeval *out, void *) {
+  out->tv_sec=simulated_wall_seconds; out->tv_usec=simulated_wall_microseconds; return 0;
+}
+#define gettimeofday mock_gettimeofday
 struct Application { uint32_t get_loop_component_start_time() {return simulated_ms;} } App;
+std::map<uint32_t,std::vector<uint8_t>> preference_data;
 struct ESPPreferenceObject {
-  float value{123}; unsigned saves{0}, loads{0};
-  void load(float *out) {++loads; *out=value;}
-  void save(float *in) {++saves; value=*in;}
+  uint32_t key{0}; unsigned saves{0}, loads{0};
+  template<typename T> bool load(T *out) {
+    ++loads; auto it=preference_data.find(key);
+    if(it==preference_data.end() || it->second.size()!=sizeof(T)) return false;
+    std::memcpy(out,it->second.data(),sizeof(T)); return true;
+  }
+  template<typename T> bool save(const T *in) {
+    ++saves; auto &bytes=preference_data[key]; bytes.resize(sizeof(T));
+    std::memcpy(bytes.data(),in,sizeof(T)); return true;
+  }
 };
+struct Preferences {
+  template<typename T> ESPPreferenceObject make_preference(uint32_t key) {return {key};}
+} preferences;
+Preferences *global_preferences=&preferences;
 struct Component {
   virtual void setup() {}
   virtual void dump_config() {}
@@ -457,17 +520,17 @@ struct Component {
 namespace sensor {struct Sensor {
   float state{NAN}; unsigned callbacks{0}; std::function<void(float)> callback;
   void publish_state(float value) {state=value;}
-  template<typename T> ESPPreferenceObject make_entity_preference() {return {};}
   void add_on_state_callback(std::function<void(float)> fn) {++callbacks; callback=fn;}
 };}
-namespace mock_time {
-struct ClockState {
-  bool valid{false}; unsigned day_of_year{1}, hour{0}, minute{0}, second{0};
+struct ESPTime {
+  bool valid{false}; unsigned year{2026}, day_of_year{1}, hour{0}, minute{0}, second{0};
+  time_t timestamp{1};
   bool is_valid() const {return valid;}
 };
+namespace mock_time {
 struct RealTimeClock {
-  ClockState state; std::function<void()> callback;
-  ClockState now() {return state;}
+  ESPTime state; std::function<void()> callback;
+  ESPTime now() {return state;}
   void add_on_time_sync_callback(std::function<void()> fn) {callback=fn;}
 };
 }
@@ -475,9 +538,15 @@ struct RealTimeClock {
     tests = r"""
 int main() {
   for (auto method : {MeteringEnergyMethod::LEFT,MeteringEnergyMethod::RIGHT,MeteringEnergyMethod::TRAPEZOID}) {
+    preference_data.clear();
+    MeteringDailyEnergy::RestoreState restored{};
+    restored.day_key=2026001; restored.energy_wh=123;
+    auto pref=global_preferences->make_preference<MeteringDailyEnergy::RestoreState>(101);
+    pref.save(&restored);
     MeteringDailyEnergy e;
     mock_time::RealTimeClock clock; sensor::Sensor parent;
     e.set_method(method); e.set_parent(&parent); e.set_time(&clock);
+    e.set_preference_key(101);
     e.set_energy_scale(1.0f);
     simulated_ms=10000;
     e.setup();
@@ -510,26 +579,237 @@ int main() {
     e.process_metering_state_(-3600);
     const float change = method==MeteringEnergyMethod::LEFT ? 1 : method==MeteringEnergyMethod::RIGHT ? -1 : 0;
     assert(std::abs(e.total_energy_-(126+change))<0.001);
-    assert(e.pref_.value==e.total_energy_);
+    assert(e.pref_.load(&restored) && restored.energy_wh==e.total_energy_);
     clock.state.valid=true; clock.callback();
     assert(e.timeout_ms==81000000 && e.total_energy_>0); // First clock sync retains restored total.
     clock.state.hour=23; clock.state.minute=59; clock.state.second=59; clock.callback();
     assert(e.timeout_ms==2000 && e.total_energy_>0);
     clock.state.day_of_year=2; clock.state.hour=0; clock.state.minute=0; clock.state.second=1;
     e.timeout();
-    assert(e.state==0 && e.pref_.value==0); // Scheduled midnight reset, same Wh persistence.
+    assert(e.state==0 && e.pref_.load(&restored) && restored.energy_wh==0 && restored.day_key==2026002);
     e.set_restore(false); auto saves=e.pref_.saves; e.publish_state_and_save(7);
     assert(e.state==7 && e.pref_.saves==saves);
   }
   MeteringDailyEnergy units;
+  units.set_restore(false);
   units.publish_state_and_save(1000);
-  assert(units.state==1 && units.total_energy_==1000 && units.pref_.value==1000);
+  assert(units.state==1 && units.total_energy_==1000);
   units.set_energy_scale(0.000001f); units.publish_state_and_save(1000000);
-  assert(units.state==1 && units.total_energy_==1000000 && units.pref_.value==1000000);
-  std::puts("PASS daily energy: restore, midnight, startup, gaps, invalid samples, methods, signed power and millis wrap");
+  assert(units.state==1 && units.total_energy_==1000000);
+
+  // Small real loads must continue adding energy after a large daily total.
+  mock_time::RealTimeClock clock; clock.state.valid=true;
+  sensor::Sensor parent;
+  MeteringDailyEnergy precise;
+  precise.set_time(&clock); precise.set_parent(&parent); precise.set_external_integration(true);
+  precise.set_preference_key(102); precise.setup();
+  assert(parent.callbacks==0);
+  precise.publish_state_and_save(100000.0);
+  constexpr double increment=50.0*220.0/3600000.0;
+  for(unsigned i=0;i<10000;++i) precise.add_integral_wh(increment);
+  assert(std::abs(precise.total_energy_-(100000.0+10000*increment))<1e-7);
+  MeteringDailyEnergy::RestoreState saved{};
+  assert(precise.pref_.load(&saved) && saved.energy_wh==precise.total_energy_);
+  precise.add_integral_wh(NAN); precise.add_integral_wh(INFINITY);
+  assert(saved.energy_wh==precise.total_energy_);
+
+  // Stored totals belong to a calendar day, including a year boundary.
+  MeteringDailyEnergy same_day;
+  same_day.set_time(&clock); same_day.set_parent(&parent); same_day.set_external_integration(true);
+  same_day.set_preference_key(102); same_day.setup();
+  assert(same_day.total_energy_==saved.energy_wh);
+  clock.state.valid=false;
+  MeteringDailyEnergy next_day;
+  next_day.set_time(&clock); next_day.set_parent(&parent); next_day.set_external_integration(true);
+  next_day.set_preference_key(102); next_day.setup(); next_day.add_integral_wh(2.0);
+  clock.state.valid=true; clock.state.day_of_year=2; clock.callback();
+  assert(next_day.total_energy_==2.0 && next_day.current_day_key_==2026002);
+  clock.state.year=2027; clock.state.day_of_year=1; clock.callback();
+  assert(next_day.total_energy_==0 && next_day.current_day_key_==2027001);
+  next_day.add_integral_wh(-0.25);
+  assert(next_day.total_energy_==-0.25);
+
+  // A new device without restored data keeps readings collected before SNTP.
+  clock.state.valid=false;
+  MeteringDailyEnergy cold;
+  cold.set_time(&clock); cold.set_parent(&parent); cold.set_external_integration(true);
+  cold.set_preference_key(103); cold.setup(); cold.add_integral_wh(0.75);
+  clock.state.valid=true; clock.callback();
+  assert(cold.total_energy_==0.75);
+  // Only the acquisition segment belonging to today's local day is counted,
+  // including a queued interval that ends just before/after midnight.
+  simulated_ms=100000;
+  clock.state.hour=0; clock.state.minute=0; clock.state.second=0;
+  simulated_wall_microseconds=250000; // Today began 250ms ago.
+  assert(std::abs(cold.interval_energy_wh(3600,1000,simulated_ms)-0.25)<1e-12);
+  assert(std::abs(cold.interval_energy_wh(3600,1000,simulated_ms-100)-0.15)<1e-12);
+  assert(cold.interval_energy_wh(3600,1000,simulated_ms-300)==0);
+  assert(std::abs(cold.interval_energy_wh(-3600,1000,simulated_ms)+0.25)<1e-12);
+  clock.state.second=2; simulated_wall_microseconds=0;
+  assert(std::abs(cold.interval_energy_wh(3600,1000,simulated_ms)-1.0)<1e-12);
+  clock.state.hour=23; clock.state.minute=59; clock.state.second=59;
+  simulated_wall_microseconds=999000;
+  assert(std::abs(cold.interval_energy_wh(3600,1000,simulated_ms)-1.0)<1e-12);
+  clock.state.hour=0; clock.state.minute=0; clock.state.second=0;
+  simulated_ms=100; simulated_wall_microseconds=500000;
+  assert(std::abs(cold.interval_energy_wh(3600,1000,UINT32_MAX-99)-0.3)<1e-12);
+  // If the wall second rolls over between reads, don't reuse its old fraction.
+  simulated_wall_seconds=0; simulated_wall_microseconds=999000;
+  assert(cold.interval_energy_wh(3600,1000,simulated_ms)==0);
+  clock.state.valid=false;
+  assert(std::abs(cold.interval_energy_wh(3600,1000,simulated_ms)-1.0)<1e-12);
+  assert(cold.interval_energy_wh(NAN,1000,simulated_ms)==0);
+  assert(cold.interval_energy_wh(3600,INFINITY,simulated_ms)==0);
+  clock.state.valid=true; simulated_wall_seconds=clock.state.timestamp;
+  clock.state.hour=23; clock.state.minute=59; clock.state.second=59;
+  uint32_t interval_day=0;
+  const double previous_day_delta=cold.interval_energy_wh(3600,1000,simulated_ms,&interval_day);
+  assert(interval_day==2027001 && previous_day_delta==1.0);
+  clock.state.day_of_year=2; clock.state.hour=0; clock.state.minute=0; clock.state.second=0;
+  cold.add_integral_wh(previous_day_delta,interval_day);
+  assert(cold.total_energy_==0); // Drain crossed midnight: never put yesterday into today.
+  cold.add_integral_wh(0.5,2027002); assert(cold.total_energy_==0.5);
+  cold.add_integral_wh(0.25); assert(cold.total_energy_==0.75);
+  clock.state.valid=false;
+  cold.interval_energy_wh(3600,1000,simulated_ms,&interval_day);
+  assert(interval_day==0);
+  std::puts("PASS daily energy: double precision, date-aware restore, startup/gaps, signed methods, external integrals, units and millis wrap");
 }
 """
     compile_run(PRELUDE + mocks + energy_class + bodies + tests)
+
+
+def test_demand_persistence_and_intervals():
+    methods = ["setup", "loop", "reset_window_", "day_key_", "publish_and_save_maximum_",
+               "reset_daily_maximum_", "check_day_", "finish_bucket_", "add_sample", "add_interval_sample"]
+    bodies = "\n".join(function(METERING, "MeteringDemandTracker::" + name) for name in methods)
+    demand_class = HEADER[HEADER.index("class MeteringDemandTracker {"):HEADER.index("class MeteringPeakTracker {")]
+    demand_class = demand_class.replace("protected:", "public:").replace("time::", "mock_time::")
+    mocks = r"""
+#include <map>
+std::map<uint32_t,std::vector<uint8_t>> preference_data;
+struct ESPPreferenceObject {
+  uint32_t key{0};
+  template<typename T> bool load(T *out) {
+    auto it=preference_data.find(key);
+    if(it==preference_data.end() || it->second.size()!=sizeof(T)) return false;
+    std::memcpy(out,it->second.data(),sizeof(T)); return true;
+  }
+  template<typename T> bool save(const T *in) {
+    auto &bytes=preference_data[key]; bytes.resize(sizeof(T));
+    std::memcpy(bytes.data(),in,sizeof(T)); return true;
+  }
+};
+struct Preferences {
+  template<typename T> ESPPreferenceObject make_preference(uint32_t key) {return {key};}
+} preferences;
+Preferences *global_preferences=&preferences;
+namespace sensor {struct Sensor {
+  float state{NAN}; unsigned publishes{0};
+  void publish_state(float value) {state=value; ++publishes;}
+  uint32_t get_object_id_hash() const {return 77;} // Identical names in different subdevices.
+};}
+struct ESPTime {
+  bool valid{true}; unsigned year{2026}, day_of_year{5};
+  bool is_valid() const {return valid;}
+};
+namespace mock_time {struct RealTimeClock {ESPTime state; ESPTime now() const {return state;}};}
+"""
+    tests = r"""
+int main() {
+  mock_time::RealTimeClock clock; sensor::Sensor sensor_a,sensor_b;
+  MeteringDemandTracker a,b;
+  a.set_maximum_sensor(&sensor_a); b.set_maximum_sensor(&sensor_b);
+  a.set_time(&clock); b.set_time(&clock);
+  a.set_preference_key(201); b.set_preference_key(202);
+  a.setup(); b.setup(); a.loop(); b.loop();
+  a.publish_and_save_maximum_(100); b.publish_and_save_maximum_(200);
+  MeteringDemandTracker restored_a,restored_b;
+  restored_a.set_maximum_sensor(&sensor_a); restored_b.set_maximum_sensor(&sensor_b);
+  restored_a.set_time(&clock); restored_b.set_time(&clock);
+  restored_a.set_preference_key(201); restored_b.set_preference_key(202);
+  restored_a.setup(); restored_b.setup(); restored_a.loop(); restored_b.loop();
+  assert(sensor_a.state==100 && sensor_b.state==200);
+  clock.state.day_of_year=6; restored_a.loop(); restored_b.loop();
+  assert(std::isnan(sensor_a.state) && std::isnan(sensor_b.state));
+
+  sensor::Sensor demand;
+  MeteringDemandTracker tracker;
+  tracker.set_interval(10000); tracker.set_demand_sensor(&demand); tracker.setup();
+  // All queued frames may be consumed in the same mainloop tick. Their actual
+  // fractional acquisition duration, not that tick, defines the mean.
+  for(unsigned i=0;i<40;++i) tracker.add_interval_sample(100,222.5,9000);
+  assert(std::isnan(demand.state));
+  tracker.add_interval_sample(100,1100,10100);
+  assert(std::abs(demand.state-100)<1e-6 && tracker.bucket_count_==2);
+  tracker.add_interval_sample(300,5000,15100);
+  assert(std::abs(demand.state-200)<1e-6);
+  tracker.add_interval_sample(NAN,220,15320);
+  assert(std::isnan(demand.state) && tracker.bucket_count_==0);
+  tracker.add_interval_sample(100,10000,25320);
+  assert(demand.state==100);
+  tracker.add_interval_sample(INFINITY,220,25540);
+  assert(std::isnan(demand.state));
+  tracker.add_interval_sample(100,30001,55541);
+  assert(tracker.bucket_count_==0);
+
+  // I2C retains left-sample integration and its startup/gap baseline.
+  MeteringDemandTracker legacy;
+  legacy.set_interval(5000); legacy.set_demand_sensor(&demand); legacy.setup();
+  legacy.add_sample(100,1000); legacy.add_sample(200,2000); legacy.add_sample(200,6000);
+  assert(std::abs(demand.state-180)<1e-6);
+  legacy.add_sample(200,60000);
+  assert(std::isnan(demand.state));
+
+  // The local date can advance while queued acquisition endpoints still refer
+  // to yesterday. Start today's maximum guard at actual observation, never at
+  // that old endpoint, and do not let unsigned subtraction bypass the guard.
+  sensor::Sensor midnight_max;
+  MeteringDemandTracker midnight;
+  midnight.set_interval(60000); midnight.set_maximum_sensor(&midnight_max);
+  midnight.set_time(&clock); midnight.set_restore(false); midnight.setup();
+  simulated_ms=100000; midnight.loop();
+  for(unsigned i=1;i<=12;++i) {
+    simulated_ms=100000+i*5000; midnight.add_interval_sample(10,5000,simulated_ms);
+  }
+  assert(midnight_max.state==10);
+  ++clock.state.day_of_year; simulated_ms=162000;
+  midnight.add_interval_sample(1000,5000,160000); // 2-second main-loop backlog.
+  assert(std::isnan(midnight_max.state) && midnight.daily_window_start_ms_==162000);
+  for(unsigned i=1;i<=12;++i) {
+    simulated_ms=160000+i*5000; midnight.add_interval_sample(20,5000,simulated_ms);
+  }
+  assert(std::isnan(midnight_max.state)); // The old anchor would permit this maximum 2s early.
+  simulated_ms=225000; midnight.add_interval_sample(20,5000,simulated_ms);
+  assert(midnight_max.state==20);
+
+  // A restored empty maximum gets the same guard; a valid same-day maximum
+  // remains immediately restorable, including near millis() rollover.
+  midnight.publish_and_save_maximum_(NAN);
+  MeteringDemandTracker empty_restore;
+  empty_restore.set_interval(60000); empty_restore.set_maximum_sensor(&midnight_max);
+  empty_restore.set_time(&clock); empty_restore.setup(); empty_restore.restored_state_valid_=true;
+  empty_restore.restored_state_={midnight.current_day_key_,NAN};
+  simulated_ms=UINT32_MAX-1000; empty_restore.check_day_(simulated_ms-1000);
+  assert(empty_restore.daily_window_start_ms_==simulated_ms && std::isnan(midnight_max.state));
+  empty_restore.add_interval_sample(30,5000,simulated_ms-500);
+  assert(std::isnan(midnight_max.state));
+  for(unsigned i=1;i<=12;++i) {
+    simulated_ms=uint32_t(UINT32_MAX-1000)+i*5000;
+    empty_restore.add_interval_sample(30,5000,simulated_ms);
+  }
+  assert(midnight_max.state==30);
+  MeteringDemandTracker valid_restore;
+  valid_restore.set_interval(60000); valid_restore.set_maximum_sensor(&midnight_max);
+  valid_restore.set_time(&clock); valid_restore.setup(); valid_restore.restored_state_valid_=true;
+  valid_restore.restored_state_={midnight.current_day_key_,75};
+  valid_restore.check_day_(simulated_ms-1000);
+  assert(midnight_max.state==75 && valid_restore.daily_maximum_valid_);
+  assert(uint32_t(simulated_ms-valid_restore.daily_window_start_ms_)==60000);
+  std::puts("PASS demand: independent restore, midnight/backlog guards, fractional intervals, millis wrap, gaps and I2C integration");
+}
+"""
+    compile_run(PRELUDE + mocks + demand_class + bodies + tests)
 
 
 def test_energy_filters():
@@ -561,12 +841,27 @@ def test_energy_filters():
         assert len(multipliers) == count and abs(result - expected) < 1e-12
     print("PASS energy units: bare, local/global throttle, legacy conversion, Wh/kWh/MWh and calibration")
 
+    # Storage is tied to the logical measurement path, not a display name or owner.
+    paths = [
+        "circuits.cir1.energy.both", "circuits.cir2.energy.both",
+        "circuits.cir1.energy.positive", "circuits.cir1.energy.negative",
+        "circuits.cir1.maximum_power_demand", "circuits.cir2.maximum_power_demand",
+        "circuits.cir1.maximum_current_demand", "mains.line_1.energy.both", "groups.grid.energy.both",
+    ]
+    keys = [component._metering_preference_key(path) for path in paths]
+    assert len(keys) == len(set(keys)) and all(keys)
+    for path, key in zip(paths, keys):
+        assert component._metering_preference_key(path) == key
+    print("PASS stable metering persistence keys: circuits, mains, groups and energy directions")
+
 
 def test_metering_timeout():
     methods = ["submit_metering_frame_", "check_metering_timeout_", "invalidate_metering_",
                "apply_power_direction_", "publish_power_outputs_"]
     bodies = [function(METERING, "EmporiaVueComponent::" + name) for name in methods]
-    declarations = [body[:body.index("{")].replace("EmporiaVueComponent::", "").rstrip() + ";" for body in bodies]
+    declarations = [re.search(
+        r"^  (?:static )?[\w:<>]+\s+" + re.escape(name) + r"\([^;]*\)(?: const)?;", HEADER, re.M
+    ).group().strip() for name in methods]
     # Every measurement sensor touched by the real invalidation path gets a
     # separate mock. Counters verify that only transient analysis is reset.
     getters = sorted(set(re.findall(r"->(get_\w+_sensor)\(\)", bodies[2])))
@@ -583,6 +878,12 @@ namespace sensor {struct Sensor {
 };}
 struct Text {std::string state; void publish_state(const char *value) {state=value;}};
 struct Detection {unsigned resets{0}; void reset_all() {++resets;}};
+struct MeteringDailyEnergy {
+  void add_integral_wh(double,uint32_t=0) {}
+  double interval_energy_wh(float power,double duration,uint32_t,uint32_t *day=nullptr) const {
+    if(day!=nullptr) *day=0; return power*duration/3600000.0;
+  }
+};
 """
     node = r"""
 struct Node {
@@ -590,6 +891,9 @@ struct Node {
   std::vector<MeteringPowerOutput> outputs{{0,&raw,&visible}};
   Text text;
   Detection detection, assignment;
+  struct Analysis {unsigned resets{0}; void reset() {++resets;}} analysis;
+  Analysis& get_analysis_tracker() {return analysis;}
+  void clear_pending_analysis() {}
   float energy{123}, maximum{456};
   int saved_line{2};
   unsigned power_gaps{0}, current_gaps{0}, peak_resets{0};
@@ -603,17 +907,18 @@ struct Node {
 """ + getter_methods + "\n};\n"
     component = r"""
 struct MeteringFrame {
-  bool valid{true}; uint32_t timestamp_ms{0}, sequence{0};
+  bool valid{true}; uint32_t timestamp_ms{0}, sequence{0}, acquisition_epoch{0};
   MeteringTransport transport{MeteringTransport::SPI}; uint8_t quality_flags{0};
 };
 class EmporiaVueComponent {public:
   uint32_t metering_timeout_ms_{2000}, last_metering_frame_ms_{0}, last_unavailable_publish_ms_{0};
   bool metering_data_stale_{true}, last_metering_sequence_valid_{false};
   uint32_t last_metering_sequence_{0}, i2c_missing_readings_window_{0};
+  uint32_t last_metering_acquisition_epoch_{0};
   MeteringTransport last_metering_transport_{MeteringTransport::UNKNOWN};
   std::vector<Node*> metering_phases_, metering_virtual_lines_, metering_ct_clamps_, metering_groups_;
   unsigned published{0};
-  void publish_metering_frame_(const MeteringFrame&) {++published;}
+  void publish_metering_frame_(const MeteringFrame&,bool) {++published;}
 """ + "\n".join(declarations) + "\n};\n"
     tests = r"""
 int main() {
@@ -624,7 +929,7 @@ int main() {
     MeteringFrame frame; frame.transport=transport;
     simulated_ms=1000; c.check_metering_timeout_(simulated_ms);
     assert(ct.raw.count==0); // Not started yet.
-    frame.timestamp_ms=simulated_ms; frame.sequence=1; c.submit_metering_frame_(frame);
+    frame.timestamp_ms=simulated_ms; frame.sequence=1; c.submit_metering_frame_(frame,true);
     simulated_ms=2000; c.check_metering_timeout_(simulated_ms); assert(ct.raw.count==0);
     simulated_ms=3001; c.check_metering_timeout_(simulated_ms);
     assert(std::isnan(ct.raw.state) && std::isnan(group.raw.state));
@@ -635,19 +940,29 @@ int main() {
     simulated_ms=3500; c.check_metering_timeout_(simulated_ms); assert(ct.raw.count==count);
     simulated_ms=4001; c.check_metering_timeout_(simulated_ms); assert(ct.raw.count==count+1);
     assert(ct.power_gaps==1 && ct.detection.resets==1); // No repeated analysis resets.
-    c.submit_metering_frame_(frame); assert(c.published==1); // Old queued frame rejected.
-    frame.timestamp_ms=simulated_ms; frame.sequence=4; c.submit_metering_frame_(frame);
+    c.submit_metering_frame_(frame,true); assert(c.published==1); // Old queued frame rejected.
+    frame.timestamp_ms=simulated_ms; frame.sequence=transport==MeteringTransport::SPI ? 2 : 4;
+    c.submit_metering_frame_(frame,true);
     assert(c.published==2 && !c.metering_data_stale_);
     assert(c.i2c_missing_readings_window_==(transport==MeteringTransport::I2C ? 2U : 0U));
-    simulated_ms=8000; frame.timestamp_ms=simulated_ms; frame.sequence=5;
-    c.submit_metering_frame_(frame); // Main loop stalled: reset even without a timeout call.
+    simulated_ms=8000; frame.timestamp_ms=simulated_ms; ++frame.sequence;
+    c.submit_metering_frame_(frame,true); // Main loop stalled: reset even without a timeout call.
     assert(ct.power_gaps==2 && c.published==3);
-    frame.valid=false; c.submit_metering_frame_(frame); assert(c.published==3);
+    frame.valid=false; c.submit_metering_frame_(frame,true); assert(c.published==3);
     frame.valid=true; simulated_ms=UINT32_MAX-1000; frame.timestamp_ms=simulated_ms;
-    c.submit_metering_frame_(frame);
+    ++frame.sequence; c.submit_metering_frame_(frame,true);
     auto resets=ct.power_gaps;
     simulated_ms+=1500; c.check_metering_timeout_(simulated_ms); assert(ct.power_gaps==resets);
-    frame.timestamp_ms=simulated_ms; c.submit_metering_frame_(frame); assert(ct.power_gaps==resets);
+    frame.timestamp_ms=simulated_ms; ++frame.sequence;
+    c.submit_metering_frame_(frame,true); assert(ct.power_gaps==resets);
+    if(transport==MeteringTransport::SPI) {
+      ++frame.acquisition_epoch; ++frame.sequence;
+      c.submit_metering_frame_(frame,false);
+      assert(ct.power_gaps==resets+1); // New stream must not bridge accumulators.
+      frame.sequence+=2;
+      c.submit_metering_frame_(frame,false);
+      assert(ct.power_gaps==resets+2); // Explicit completed-window loss is a gap too.
+    }
   }
   MeteringPeakTracker peak; sensor::Sensor current, crest;
   peak.set_current_peak_sensor(&current); peak.set_current_crest_factor_sensor(&crest);
@@ -668,5 +983,6 @@ if __name__ == "__main__":
     test_current_peak_preservation()
     test_fundamental_analysis_math()
     test_energy_gaps()
+    test_demand_persistence_and_intervals()
     test_energy_filters()
     test_metering_timeout()

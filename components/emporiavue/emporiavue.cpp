@@ -119,12 +119,28 @@ void EmporiaVueComponent::publish_restart_reason_() {
 }
 
 void EmporiaVueComponent::loop() {
+  if (this->backup_active_) {
+    this->check_metering_timeout_(millis());
+    this->process_backup_();
+    return;
+  }
+  if (this->install_active_) {
+    this->check_metering_timeout_(millis());
+    this->process_install_();
+    return;
+  }
+  // Drain acquisition-time statistics before checking wall-time timeouts or
+  // closing peak windows; a briefly delayed UI must not finalize them early.
+  this->process_spi_receiver_();
   const uint32_t now = millis();
   this->check_metering_timeout_(now);
   if ((now - this->last_peak_check_ms_) >= 50) {
     this->last_peak_check_ms_ = now;
+    const uint32_t peak_now = this->last_metering_transport_ == MeteringTransport::SPI && !this->metering_data_stale_
+                                  ? this->last_metering_frame_ms_
+                                  : now;
     for (auto *ct_clamp : this->metering_ct_clamps_) {
-      ct_clamp->loop_peak(now);
+      ct_clamp->loop_peak(peak_now);
     }
   }
   if ((now - this->last_demand_day_check_ms_) >= 1000) {
@@ -136,15 +152,6 @@ void EmporiaVueComponent::loop() {
       group->loop_demand();
     }
   }
-  if (this->backup_active_) {
-    this->process_backup_();
-    return;
-  }
-  if (this->install_active_) {
-    this->process_install_();
-    return;
-  }
-  this->process_spi_receiver_();
 }
 
 void EmporiaVueComponent::dump_config() {
@@ -494,6 +501,8 @@ void MeteringCTClampConfig::start_auto_line_detection(bool export_direction, boo
     return;
   }
   this->phase_ = nullptr;
+  this->analysis_tracker_.reset();
+  this->clear_pending_analysis();
   this->line_pair_phase_b_ = nullptr;
   this->line_pair_ = false;
   this->auto_line_detection_active_ = true;
