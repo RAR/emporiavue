@@ -1,0 +1,60 @@
+Emporia Vue ESPHome — third-party notices
+
+Copyright (C) 2026 rosenrot00 and project contributors.
+Project license: GNU General Public License version 3 only (GPL-3.0-only).
+The full license is reproduced in LICENSE. Existing third-party rights and
+notices remain unchanged; the project license does not replace their terms
+or supply missing upstream permission.
+
+ESPHome and emporia-vue-local
+---------------------------
+This integration builds on the local Vue metering work in
+https://github.com/emporia-vue-local/esphome and on ESPHome:
+https://github.com/esphome/esphome
+ESPHome licenses its C/C++ runtime under GPLv3 and its Python code and other
+parts under MIT. Preserve the original notices when redistributing inherited
+material. The ESPHome MIT notice is reproduced in LICENSES/ESPHome-MIT.txt;
+the GPLv3 text is reproduced in LICENSE. Dependencies fetched at build time
+retain their own licenses and are not relicensed by this repository.
+
+SAMD09 reference firmware
+------------------------
+The SAMD09 firmware includes material originating from
+https://github.com/gekkehenkie11/emporia-SAMD09
+(imported reference: 0baafe6d8812639d14f8f66b03844567f913ddc0).
+No explicit upstream license grant was established for that reference code.
+The project GPL declaration covers our original contributions, not ownership
+or a new license grant for this underlying third-party material. Upstream
+permission/licensing must be resolved before claiming that the complete
+derived SAMD09 firmware is unambiguously GPL-licensed or freely redistributable.
+Original manufacturer firmware dumps are not licensed by this declaration.
+
+SAMD09 linker script
+--------------------
+firmware/samd09/samd09d14.ld retains the following notice:
+
+Copyright (c) 2019, Alex Taradov <alex@taradov.com>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. The name of the author may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.

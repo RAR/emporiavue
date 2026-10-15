@@ -307,6 +307,15 @@ class EmporiaVueComponent : public Component
     SPI = 2,
   };
 
+  struct MeteringFrame;
+
+  // Register during setup. Called synchronously in the main loop for each accepted
+  // measurement window, before aggregation/publication (including publish=false).
+  // The raw, read-only frame reference is valid only during this non-blocking callback.
+  template<typename F> void add_on_frame_callback(F &&callback) {
+    this->frame_callbacks_.add(std::forward<F>(callback));
+  }
+
   void setup() override;
   void loop() override;
   void dump_config() override;
@@ -583,6 +592,7 @@ class EmporiaVueComponent : public Component
     uint16_t end;
   } __attribute__((packed));
 
+ public:
   struct MeteringPhase {
     // 32-bit measurements.
     float voltage_fundamental_i_raw{0.0f};
@@ -643,6 +653,7 @@ class EmporiaVueComponent : public Component
     bool voltage_statistics_valid{false};
   };
 
+ protected:
   static_assert(sizeof(MeteringPhase) == 32, "MeteringPhase layout unexpectedly gained padding");
   static_assert(sizeof(MeteringClamp) == 32, "MeteringClamp layout unexpectedly gained padding");
   static_assert(sizeof(MeteringFrame) == 752, "MeteringFrame layout unexpectedly gained padding");
@@ -1216,6 +1227,7 @@ class EmporiaVueComponent : public Component
   float minimum_fundamental_current_{0.02f};
   uint32_t line_detection_update_interval_ms_{10000};
   float line_detection_confidence_ratio_{1.5f};
+  CallbackManager<void(const MeteringFrame &)> frame_callbacks_;
   std::vector<MeteringPhaseConfig *> metering_phases_{};
   std::vector<MeteringCTClampConfig *> metering_ct_clamps_{};
   std::vector<MeteringGroupConfig *> metering_groups_{};

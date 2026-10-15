@@ -62,6 +62,15 @@ PRELUDE = r"""
 #include <cassert>
 #include <string>
 #include <functional>
+#include <utility>
+template<typename...> class CallbackManager;
+template<typename... Args> class CallbackManager<void(Args...)> {
+ public:
+  template<typename F> void add(F &&callback) { callbacks_.emplace_back(std::forward<F>(callback)); }
+  void call(Args... args) { for (auto &callback : callbacks_) callback(args...); }
+ private:
+  std::vector<std::function<void(Args...)>> callbacks_;
+};
 #define ESP_LOGD(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
@@ -83,7 +92,7 @@ def test_spi_windows():
     bodies[-1] = bodies[-1][:-len(reset_marker)] + (
         "assert(frame.duration_ms > 0 && std::isfinite(frame.duration_ms));\n"
         "output.push_back(frame);\ncounts.push_back(acc.sample_count);\n" + reset_marker)
-    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  enum MemSize")]
+    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  enum MemSize")].replace("protected:", "public:")
     fields = HEADER[HEADER.index("  SpiMeteringAccumulator spi_metering_accumulator_"):HEADER.index("  volatile uint16_t spi_rx_inflight_")]
     constants = HEADER[HEADER.index("static constexpr float VUE2_STOCK_CYCLE"):HEADER.index("class MeteringPhaseConfig;")]
     helpers = SPI[SPI.index("static constexpr uint8_t SPI_VUE2_RAW_FRAME_VERSION"):SPI.index("void EmporiaVueComponent::publish_spi_diagnostics_")]
@@ -912,6 +921,7 @@ struct MeteringFrame {
 };
 class EmporiaVueComponent {public:
   uint32_t metering_timeout_ms_{2000}, last_metering_frame_ms_{0}, last_unavailable_publish_ms_{0};
+  CallbackManager<void(const MeteringFrame &)> frame_callbacks_;
   bool metering_data_stale_{true}, last_metering_sequence_valid_{false};
   uint32_t last_metering_sequence_{0}, i2c_missing_readings_window_{0};
   uint32_t last_metering_acquisition_epoch_{0};

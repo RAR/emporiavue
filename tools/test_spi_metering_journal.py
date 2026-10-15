@@ -24,7 +24,7 @@ def test_journal():
              "prepare_ct_power_analysis_", "publish_queued_spi_metering_"]
     bodies = [function(SPI if name == "publish_queued_spi_metering_" else METERING,
                        "EmporiaVueComponent::" + name) for name in names]
-    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  struct SpiRawScan {")]
+    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  struct SpiRawScan {")].replace("protected:", "public:")
     classes = (
         HEADER[HEADER.index("class MeteringPowerFilters {"):HEADER.index("class EmporiaVueComponent :")]
         + HEADER[HEADER.index("class MeteringPhaseConfig {"):HEADER.index("class MeteringCalibrationNumber :")]
@@ -98,6 +98,7 @@ int xQueueReceive(QueueHandle_t q,void *record,unsigned) {
 class EmporiaVueComponent { public:
 """ + structs + "\n" + "\n".join(declaration(name) for name in names) + r"""
   uint32_t metering_timeout_ms_{2000},last_metering_frame_ms_{0},last_unavailable_publish_ms_{0};
+  CallbackManager<void(const MeteringFrame &)> frame_callbacks_;
   bool metering_data_stale_{true},last_metering_sequence_valid_{false};
   uint32_t last_metering_sequence_{0},last_metering_acquisition_epoch_{0},i2c_missing_readings_window_{0};
   uint32_t metering_calculation_generation_{0},spi_metering_stale_windows_{0};
@@ -197,10 +198,17 @@ void run_tests() {
   {
     Fixture f;
     const int powers[]{100,0,-100,0,25};
+    std::vector<uint32_t> callback_sequences;
+    f.c.frame_callbacks_.add([&](const Frame &frame) {
+      callback_sequences.push_back(frame.sequence);
+      assert(f.a_filter_calls==frame.sequence-1); // Before aggregation/filter evaluation.
+      near(frame.duration_ms,200.5);
+    });
     const float qs[]{30,20,10,200,300};
     for(unsigned i=0;i<5;++i) assert(f.enqueue(f.make(i+1,powers[i],qs[i],10*(i+1),i==0?10:2)));
     simulated_ms=1900; // Five acquisition windows, drained in one main-loop tick.
     f.c.publish_queued_spi_metering_(); assert(f.queue.records.empty());
+    assert((callback_sequences==std::vector<uint32_t>{1,2,3,4,5}));
     near(f.energy.total,50*200.5/3600000.0);
     near(f.net_energy.total,-75*200.5/3600000.0);
     near(f.import_energy.total,315*200.5/3600000.0);

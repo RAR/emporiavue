@@ -459,6 +459,7 @@ void EmporiaVueComponent::submit_metering_frame_(const MeteringFrame &frame, boo
                           frame.transport == MeteringTransport::I2C ? "I2C" : "unknown";
   ESP_LOGV(TAG, "SAMD09 %s metering frame: seq=%" PRIu32 ", flags=0x%02x", transport, frame.sequence,
            frame.quality_flags);
+  this->frame_callbacks_.call(frame);
   this->publish_metering_frame_(frame, publish);
 }
 

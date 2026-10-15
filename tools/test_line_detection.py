@@ -5,7 +5,7 @@ from test_esphome_metering import HEADER, METERING, PRELUDE, compile_run, functi
 
 def test_line_detection():
     state = HEADER[HEADER.index("class MeteringLineDetectionState {"):HEADER.index("class MeteringCTClampConfig {")]
-    frames = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  struct SpiRawScan {")]
+    frames = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  struct SpiRawScan {")].replace(" protected:\n", "")
     body = function(METERING, "EmporiaVueComponent::update_line_detection_")
     mocks = r"""
 #include <cstdarg>

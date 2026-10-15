@@ -25,7 +25,7 @@ def test_spi_entities():
                   "calculate_group_power_", "prepare_ct_power_analysis_"]
     bodies = [function(SPI, "EmporiaVueComponent::" + name) for name in spi_names]
     bodies += [function(METERING, "EmporiaVueComponent::" + name) for name in math_names]
-    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  enum MemSize")]
+    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  enum MemSize")].replace("protected:", "public:")
     fields = HEADER[HEADER.index("  SpiMeteringAccumulator spi_metering_accumulator_"):
                     HEADER.index("  volatile uint16_t spi_rx_inflight_")]
     constants = HEADER[HEADER.index("static constexpr float VUE2_STOCK_CYCLE"):
@@ -95,6 +95,7 @@ int xQueueReceive(QueueHandle_t q,void *record,unsigned) {
 }
 """
     extra = r"""
+  CallbackManager<void(const MeteringFrame &)> frame_callbacks_;
   uint16_t hardware_id_{2}; uint32_t metering_interval_ms_{220};
   float spi_sample_rate_hz_{0},minimum_apparent_power_{5},minimum_fundamental_current_{0.02f};
   uint32_t spi_last_frame_samples_{0},spi_invalid_window_last_log_ms_{0};

@@ -23,7 +23,7 @@ def test_waveform_math():
     bodies[-1] = bodies[-1][:-len(marker)] + "output.push_back(frame);\n" + marker
     bodies += [function(METERING, "EmporiaVueComponent::" + name) for name in math_names]
     declarations = [body[:body.index("{")].replace("EmporiaVueComponent::", "").rstrip() + ";" for body in bodies]
-    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  enum MemSize")]
+    structs = HEADER[HEADER.index("  struct MeteringPhase {"):HEADER.index("  enum MemSize")].replace("protected:", "public:")
     fields = HEADER[HEADER.index("  SpiMeteringAccumulator spi_metering_accumulator_"):
                     HEADER.index("  volatile uint16_t spi_rx_inflight_")]
     constants = HEADER[HEADER.index("static constexpr float VUE2_STOCK_CYCLE"):

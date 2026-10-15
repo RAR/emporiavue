@@ -7,6 +7,7 @@ or use the ESPHome SPI path when you specifically want synchronized raw-waveform
 
 | Version | Changes |
 |---|---|
+| 2026.10.2 | Added a lightweight C++ per-metering-frame callback hook for external components, before aggregation and publication, on both I2C and SPI. Added the GPLv3 project license and third-party notices. No YAML changes or SAMD firmware update required. |
 | 2026.10.1 | Added optional SPI `analysis_interval` for duration-weighted P1/Q1 analysis of fundamental reactive power, power factor and displacement angle. Improved daily-energy precision and date-aware restore, stable energy/demand storage keys, acquisition-timed SPI aggregation, fractional RMS and Vue 3 UART reception/diagnostics. **One-time reset:** saved daily energy and daily demand maxima use a new storage format/key. Internal power filters no longer affect apparent power or physical PF. No required YAML changes. |
 | 2026.09.2 | Peak and crest factor now report `unknown` below the current threshold or for inconsistent measurements; sampled short peaks remain unfiltered. No YAML changes required. |
 | 2026.09.1 | **Breaking change:** `energy:` now converts to kWh automatically. Remove `multiply: 0.001` from local energy filters and `filter_defaults.energy`; it is no longer needed. See [Energy](#energy). Existing exact conversion filters are recognized to prevent double scaling. |
@@ -1410,6 +1411,39 @@ omitted if you do not want the status LEDs.
 | `packages/vue3-2phase.yaml` | Vue 3 two-line/split-phase topology |
 | `packages/vue3-3phase.yaml` | Vue 3 three-phase-with-neutral topology |
 | `packages/vue3-gpios.yaml` | Optional Vue 3 status GPIO helpers |
+
+### C++ metering-frame hook
+
+External components can register a listener once during `setup()`:
+
+```cpp
+using Frame = esphome::emporiavue::EmporiaVueComponent::MeteringFrame;
+meter->add_on_frame_callback([this](const Frame &frame) {
+  this->handle_frame(frame);  // Your component's short, non-blocking handler.
+});
+```
+
+The listener runs synchronously in the ESPHome main loop for every accepted, fresh measurement window,
+before energy/demand/analysis aggregation and entity publication. This includes queued SPI windows whose
+instantaneous display is skipped. Invalid or expired frames are not delivered. This is not an ADC-sample
+or raw SPI-packet callback; the normal measurement window is approximately 220 ms.
+
+`MeteringFrame` contains transport-normalized **raw statistics**, not calibrated W/var or complete waveforms.
+Use its validity flags and phase masks; optional fundamental/THD data are present only when enabled by the
+configuration and supported by the transport. Registering a callback does not enable extra calculations.
+For SPI acquisition timing use `timestamp_ms` and `duration_ms`, not callback delivery time; check `sequence`
+and `acquisition_epoch` for gaps/restarts. Queued windows can be delivered together after a main-loop delay.
+I2C instead provides the ESP32 read timestamp, `duration_ms: 0`, and the native wrapping 8-bit sequence;
+it does not provide SPI acquisition timing or fundamental phasors.
+
+The `const` reference is valid only during the callback. Do not retain it, block, register more listeners,
+or reenter metering from the handler. There is no additional task, queue or frame copy; without listeners,
+only the empty callback-manager check is performed. No new YAML option is required.
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0** (`GPL-3.0-only`).
+See [LICENSE](LICENSE) for the full license and [NOTICE](NOTICE) for third-party notices.
 
 ## Contributing and Validation
 
