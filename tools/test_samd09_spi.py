@@ -43,7 +43,17 @@ struct W1C {
 W1C REG_ADC_INTFLAG, REG_TC1_INTFLAG, REG_DMAC_CHINTFLAG;
 uint16_t REG_TC1_CTRLA = 2;
 uint8_t REG_TC1_STATUS = 0, REG_ADC_STATUS = 0, REG_ADC_CTRLA = 2;
-uint8_t REG_DMAC_CHID = 0, REG_DMAC_CHCTRLA = 2;
+uint8_t REG_DMAC_CHID = 0;
+void (*after_adc_dma_enabled)() = nullptr;
+struct DmaEnableRegister {
+    uint8_t value = 2;
+    operator uint8_t() const { return value; }
+    DmaEnableRegister &operator=(uint8_t bits) {
+        value = bits;
+        if (bits == 2 && after_adc_dma_enabled) after_adc_dma_enabled();
+        return *this;
+    }
+} REG_DMAC_CHCTRLA;
 uint16_t REG_ADC_RESULT = 0;
 uint32_t REG_PORT_OUT = 0, REG_PORT_OUTSET = 0, REG_PORT_OUTCLR = 0;
 #define STATUS_SYNCBUSY_BIT 0x80
@@ -90,9 +100,10 @@ uint16_t read_uart_data() {
 
 TESTS = r"""
 void reset_stream() {
+    after_adc_dma_enabled = nullptr;
     SpiBuildFrameIndex = SpiReadyHead = SpiReadyCount = SpiBuildScanIndex = 0;
     SpiFrameSequence = SpiPendingFlags = 0;
-    SpiSampleCounter = SpiFrameOverruns = 0;
+    SpiSampleCounter = 0;
     DMAresultIndex = MuxCounter = 0;
     DiscardNextAdcScan = false;
     dmabool = true;
@@ -113,6 +124,70 @@ void test_adc_startup() {
     assert(!DiscardNextAdcScan && MuxCounter == 0 && SpiSampleCounter == 0);
 }
 
+int16_t adc_pattern(unsigned scan, unsigned channel) {
+    return int16_t((scan * 97 + channel * 613) % 4096) - 2048;
+}
+unsigned next_dma_scan = 0;
+void fill_next_adc_scan() {
+    assert(DMAresultIndex < ADC_SCAN_BUFFER_COUNT);
+    assert(DMAdescriptor[DMA_CHANNEL_ADC].BTCNT == ADC_CHANNEL_COUNT);
+    assert(DMAdescriptor[DMA_CHANNEL_ADC].DSTADDR ==
+        uint32_t(uintptr_t(&DMAresults[DMAresultIndex][ADC_CHANNEL_COUNT])));
+    for(unsigned channel=0;channel<ADC_CHANNEL_COUNT;++channel)
+        DMAresults[DMAresultIndex][channel]=adc_pattern(next_dma_scan,channel);
+    ++next_dma_scan;
+}
+void test_adc_ping_pong() {
+    reset_stream();
+#ifdef EMPORIAVUE_TARGET_VUE3
+    // Bypass UART here: isolate exact ADC scan ordering and buffer ownership.
+    VoltageValuesValid=true;
+    VoltagePacketGeneration=VoltagePacketConsumedGeneration=0;
+    VoltageAgeScans=VoltageUartErrors=VoltageTelegramUpdates=VoltageRejectedTelegrams=0;
+    DecodedVoltage[0]=-1234; DecodedVoltage[1]=567; DecodedVoltage[2]=2047;
+#endif
+    next_dma_scan=0;
+    // First scan is already complete. Every rearm immediately fills the NEXT
+    // buffer, before capture_spi_scan reads the old buffer in the same ISR.
+    for(unsigned channel=0;channel<ADC_CHANNEL_COUNT;++channel)
+        DMAresults[0][channel]=adc_pattern(next_dma_scan,channel);
+    ++next_dma_scan;
+    after_adc_dma_enabled=fill_next_adc_scan;
+    uint64_t fingerprint=14695981039346656037ULL;
+    unsigned frames=0;
+    for(unsigned scan_number=0;scan_number<SPI_RAW_SCAN_COUNT*128;++scan_number) {
+        const unsigned frame_index=SpiBuildFrameIndex,scan_index=SpiBuildScanIndex;
+        const unsigned completed=DMAresultIndex;
+        handle_adc_dma_interrupt(DMA_INT_TRANSFER_COMPLETE);
+        assert(DMAresultIndex==(completed+1)%ADC_SCAN_BUFFER_COUNT);
+        assert(DMAresultIndex!=completed);
+        const auto &scan=SpiFrames[frame_index].scans[scan_index];
+        assert(scan.mux_index==scan_number%8);
+#ifdef EMPORIAVUE_TARGET_VUE3
+        assert(scan.value[0]==-1234 && scan.value[2]==567 && scan.value[4]==2047);
+        const unsigned positions[]{1,3,5,6,7};
+        for(unsigned channel=0;channel<ADC_CHANNEL_COUNT;++channel)
+            assert(scan.value[positions[channel]]==adc_pattern(scan_number,channel));
+#else
+        for(unsigned channel=0;channel<ADC_CHANNEL_COUNT;++channel)
+            assert(scan.value[channel]==adc_pattern(scan_number,channel));
+#endif
+        while(SpiReadyCount) {
+            const auto &frame=SpiFrames[SpiReadyFrameIndex[SpiReadyHead]];
+            assert(frame.header.sample_counter==frames*SPI_RAW_SCAN_COUNT);
+            assert(frame.header.sequence==frames);
+            const auto *bytes=reinterpret_cast<const uint8_t*>(&frame);
+            for(unsigned i=0;i<SPI_FRAME_SIZE;++i) fingerprint=(fingerprint^bytes[i])*1099511628211ULL;
+            ++frames;
+            SpiReadyHead=(SpiReadyHead+1)%SPI_READY_QUEUE_CAPACITY;
+            --SpiReadyCount;
+        }
+    }
+    after_adc_dma_enabled=nullptr;
+    assert(frames==128 && SpiSampleCounter==SPI_RAW_SCAN_COUNT*128);
+    std::printf("ADC scan ordering / full-frame fingerprint: %016llx\n",(unsigned long long)fingerprint);
+}
+
 void test_queue_error_retention() {
     reset_stream();
     finalize_spi_frame();
@@ -126,7 +201,7 @@ void test_queue_error_retention() {
     const uint16_t errors = SPI_FLAG_OVERRUN | SPI_FLAG_DMA_ERROR |
         SPI_FLAG_VOLTAGE_ERROR | SPI_FLAG_ADC_OVERRUN;
     assert(SpiPendingFlags == errors);
-    assert(SpiFrameOverruns == 2 && SpiFrameSequence == 4);
+    assert(SpiFrameSequence == 4);
     assert(SpiReadyCount == SPI_READY_QUEUE_CAPACITY);
     assert(SpiFrames[active].header.sequence == active_sequence);
     // Release one TX slot, then accept a frame carrying all retained errors.
@@ -487,6 +562,7 @@ void test_adc_recovery() {
 }
 int main() {
     test_adc_startup();
+    test_adc_ping_pong();
     test_queue_error_retention();
     test_adc_recovery();
 #ifdef EMPORIAVUE_TARGET_VUE3
@@ -525,15 +601,23 @@ def main() -> None:
     program = program.replace("(uint32_t) &", "(uint32_t) (uintptr_t) &")
     with tempfile.TemporaryDirectory(prefix="samd09-spi-tests-") as directory:
         for hardware in (2, 3):
-            output = Path(directory) / f"vue{hardware}"
             defines = ["-DEMPORIAVUE_TARGET_VUE3=1"] if hardware == 3 else []
-            command = shlex.split(os.environ.get("CXX", "c++")) + [
-                "-std=c++11", "-O2", "-Wall", "-Wextra", "-Werror", *defines,
-                "-x", "c++", "-", "-o", str(output),
-            ]
-            subprocess.run(command, input=program, text=True, check=True)
+            results = []
+            assert "#define ADC_SCAN_BUFFER_COUNT 2" in program
+            for buffers in (2, 6):
+                output = Path(directory) / f"vue{hardware}-{buffers}buffers"
+                variant = program.replace("#define ADC_SCAN_BUFFER_COUNT 2", f"#define ADC_SCAN_BUFFER_COUNT {buffers}")
+                command = shlex.split(os.environ.get("CXX", "c++")) + [
+                    "-std=c++11", "-O2", "-Wall", "-Wextra", "-Werror",
+                    "-fsanitize=undefined", "-fno-sanitize-recover=all", *defines,
+                    "-x", "c++", "-", "-o", str(output),
+                ]
+                subprocess.run(command, input=variant, text=True, check=True)
+                results.append(subprocess.run([str(output)], text=True, capture_output=True, check=True).stdout)
+            assert results[0] == results[1], "Two- and six-buffer results differ"
             print(f"Vue {hardware}:", flush=True)
-            subprocess.run([str(output)], check=True)
+            print(results[0], end="")
+            print("Two/six ADC buffers: identical frame bytes and fault-test results")
 
 
 if __name__ == "__main__":

@@ -213,17 +213,19 @@ static inline void set_boot_stage(uint32_t stage)
 volatile bool dmabool = false;
 volatile bool DiscardNextAdcScan = false;
 volatile uint8_t DMAresultIndex = 0;
+uint8_t MuxCounter = 0; //Varies between 0 and 7 to switch between the 8 muxes, each serving 2 50A CT's
 #ifdef EMPORIAVUE_TARGET_VUE3
 #define ADC_CHANNEL_COUNT 5
-int16_t DMAresults[6][ADC_CHANNEL_COUNT];
 // Vue 3 scans AIN3..AIN7: three main-current inputs followed by two multiplexed branch-current inputs.
 #else
 #define ADC_CHANNEL_COUNT 8
-int16_t DMAresults[6][ADC_CHANNEL_COUNT];
 // Vue 2 layout: MainCT1_V, MainCT1_A, MainCT2_V, MainCT2_A, MainCT3_V, MainCT3_A, Mux1_A, Mux2_A.
 #endif
+#define ADC_SCAN_BUFFER_COUNT 2
+// One completed scan is copied while DMA fills the other. SPI delay alignment
+// is performed on the ESP32; no older ADC scan is consumed on the SAMD09.
+int16_t DMAresults[ADC_SCAN_BUFFER_COUNT][ADC_CHANNEL_COUNT];
 
-uint8_t MuxCounter = 0; //Varies between 0 and 7 to switch between the 8 muxes, each serving 2 50A CT's
 #ifdef EMPORIAVUE_TARGET_VUE3
 const uint32_t outputpinTable [8] = { 0, 0x10000, 0x20000, 0x30000, 0x1000000, 0x1010000, 0x1020000, 0x1030000 };
 #define MUX_SWITCH_GUARD_PIN_MASK 0x100UL // Vue 3 stock firmware changes the PA08 pull while switching.
@@ -239,7 +241,7 @@ const uint32_t outputpinTable [8] = { 0x1000000, 0x1010000, 0x1020000, 0x1030000
 #define EMPORIAVUE_MODE_ID           2
 #endif
 #ifndef EMPORIAVUE_FIRMWARE_VERSION
-#define EMPORIAVUE_FIRMWARE_VERSION  10
+#define EMPORIAVUE_FIRMWARE_VERSION  11
 #endif
 
 #ifdef EMPORIAVUE_TARGET_VUE3
@@ -321,33 +323,35 @@ typedef char SpiRawPayloadSizeCheck[(sizeof(struct SpiRawScan) * SPI_RAW_SCAN_CO
 #define SPI_FRAME_BUFFER_COUNT         3
 #define SPI_READY_QUEUE_CAPACITY       (SPI_FRAME_BUFFER_COUNT - 1)
 
+// Keep equal-alignment globals together to avoid unnecessary RAM padding.
+volatile uint32_t SpiSampleCounter = 0;
+volatile uint16_t SpiFrameSequence = 0;
+volatile uint16_t SpiPendingFlags = 0;
 struct SpiRawFrame SpiFrames[SPI_FRAME_BUFFER_COUNT];
 volatile uint8_t SpiBuildFrameIndex = 0;
-volatile uint8_t SpiReadyFrameIndex[SPI_READY_QUEUE_CAPACITY];
 volatile uint8_t SpiReadyHead = 0;
 volatile uint8_t SpiReadyCount = 0;
 volatile uint8_t SpiBuildScanIndex = 0;
-volatile uint16_t SpiFrameSequence = 0;
-volatile uint16_t SpiPendingFlags = 0;
-volatile uint32_t SpiSampleCounter = 0;
-volatile uint32_t SpiFrameOverruns = 0;
 volatile bool SpiTxActive = false;
 volatile bool SpiTxAwaitingComplete = false;
+volatile uint8_t SpiReadyFrameIndex[SPI_READY_QUEUE_CAPACITY] __attribute__((aligned(1)));
 
 #ifdef EMPORIAVUE_TARGET_VUE3
-volatile uint8_t VoltagePacketBuild[6];
-volatile uint8_t VoltagePacketBuildLength = 0;
-volatile uint8_t VoltagePacketPublished[6];
 volatile uint32_t VoltagePacketGeneration = 0;
 volatile uint32_t VoltageUartErrors = 0;
 uint32_t VoltagePacketConsumedGeneration = 0;
 uint32_t VoltageTelegramUpdates = 0;
 uint32_t VoltageRejectedTelegrams = 0;
 uint32_t VoltageAgeScans = 0;
+// These small CPU-only arrays need only their element alignment, not the
+// compiler's preferred word alignment. DMA descriptors/frames stay unchanged.
+int16_t DecodedVoltage[3] __attribute__((aligned(2)));
+volatile uint8_t VoltagePacketBuild[6] __attribute__((aligned(1)));
+volatile uint8_t VoltagePacketPublished[6] __attribute__((aligned(1)));
+volatile uint8_t VoltagePacketBuildLength = 0;
 // Once acquired, keep the last validated voltage snapshot until a newer valid
 // UART telegram replaces it.
 bool VoltageValuesValid = false;
-int16_t DecodedVoltage[3];
 #endif
 
 static uint32_t spi_enter_critical(void)
@@ -483,7 +487,6 @@ static void finalize_spi_frame(void)
 	frame->crc32 = 0;
 	if (SpiReadyCount >= SPI_READY_QUEUE_CAPACITY)
 	{
-		SpiFrameOverruns++;
 		// The dropped frame cannot report its errors. Keep them pending until
 		// a later frame is actually queued for transmission.
 		SpiPendingFlags |= SPI_FLAG_OVERRUN;
@@ -881,9 +884,7 @@ static void handle_adc_dma_interrupt(uint8_t flags)
 	}
 
 	const uint8_t lastindex = DMAresultIndex;
-	DMAresultIndex++;
-	if (DMAresultIndex > 5)
-		DMAresultIndex = 0;
+	DMAresultIndex = (uint8_t) ((DMAresultIndex + 1) % ADC_SCAN_BUFFER_COUNT);
 
 	__asm__ __volatile__("dmb sy" ::: "memory");
 	if (DiscardNextAdcScan)

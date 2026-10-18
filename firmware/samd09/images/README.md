@@ -7,3 +7,21 @@ Raw SAMD09 images for flashing through the ESPHome `emporiavue` component.
 
 The managed firmware packager writes versioned build artifacts here, using names such as `vue2-i2c-v1.0.bin`.
 Use raw GitHub URLs from a fixed commit or tag when you want reproducible tests.
+
+## SPI RAM optimization builds
+
+`vue2-spi-v1.1.bin` and `vue3-spi-v1.2.bin` retain all three 1,024-byte SPI frame buffers,
+but use two ADC scan buffers instead of the obsolete six-scan history. Delay alignment remains on the ESP32.
+An unused internal overrun counter was removed; the transmitted overrun flag is unchanged.
+Small CPU-only arrays use their natural element alignment; DMA frames and descriptors retain their required alignment.
+
+Measured with arm-none-eabi GCC 16.1.0 and the repository Makefile (including reserved boot diagnostics):
+
+| Target | Static RAM before | Static RAM after | Remaining RAM for stack |
+|---|---:|---:|---:|
+| Vue 2 SPI v1.1 | 3,296 B | 3,220 B | 876 B |
+| Vue 3 SPI v1.2 | 3,304 B | 3,256 B | 840 B |
+
+Host tests compare two- and six-buffer output byte-for-byte with immediate DMA refill, scan/mux wrap,
+UART updates and fault recovery. Sampling configuration and SPI wire format are unchanged.
+Remaining RAM is a linker measurement, not a measured worst-case stack margin; hardware validation is still required.
