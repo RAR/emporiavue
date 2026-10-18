@@ -381,6 +381,26 @@ static void configure_idle_sleep(void)
 	__asm__ __volatile__("isb sy" ::: "memory");
 }
 
+__attribute__((noinline, noclone, section(".ramfunc")))
+static void sleep_and_restore_interrupts_from_ram(uint32_t primask)
+{
+	// SAMD09 errata DS80000839B, issue 3: wake in SRAM, then force a real
+	// Flash fetch before restoring interrupts or returning to Flash code.
+	// The two volatile word reads are separated by the 64-byte cache size.
+	// Keep this function self-contained: no Flash-resident callees/literals.
+	__asm__ __volatile__(
+		"dsb sy\n\t"
+		"wfi\n\t"
+		"movs r1, #64\n\t"
+		"ldr r2, [r1]\n\t"
+		"movs r1, #128\n\t"
+		"ldr r2, [r1]\n\t"
+		"dsb sy\n\t"
+		"isb sy\n\t"
+		"msr primask, %0"
+		: : "r" (primask) : "r1", "r2", "cc", "memory");
+}
+
 static void wait_for_spi_work(void)
 {
 	// Sleep while DMA owns the transmitter or no complete frame exists. An
@@ -389,10 +409,10 @@ static void wait_for_spi_work(void)
 	const uint32_t primask = spi_enter_critical();
 	if (SpiTxActive || SpiReadyCount == 0)
 	{
-		__asm__ __volatile__("dsb sy" ::: "memory");
-		__asm__ __volatile__("wfi");
+		sleep_and_restore_interrupts_from_ram(primask);
 	}
-	spi_exit_critical(primask);
+	else
+		spi_exit_critical(primask);
 }
 
 static uint8_t spi_ready_queue_contains(uint8_t frame_index)
@@ -1248,10 +1268,9 @@ void ConfigureTimerCounter1 () {
 
 void Config_NVMCTRL ()
 {
-	// Keep Flash awake while the CPU uses WFI (SAMD09 errata DS80000839B,
-	// issue 3). Set this in the final configuration, not just the startup write
-	// in main(): MANW=1, RWS=1 unchanged; SLEEPPRM=DISABLED (bits 9:8 = 3).
-	REG_NVMCTRL_CTRLB = 0x382;
+	// MANW=1, RWS=1; permit Flash sleep. The complete wake-up sequence runs
+	// from SRAM and forces Flash awake before interrupts/Flash code resume.
+	REG_NVMCTRL_CTRLB = 0x82;
 }
 
 void config_EventSystem ()

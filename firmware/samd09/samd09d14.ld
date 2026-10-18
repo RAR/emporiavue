@@ -61,7 +61,9 @@ SECTIONS
   {
     FILL(0xff)
     _data = .;
+    _ramfunc_start = .;
     *(.ramfunc .ramfunc.*);
+    _ramfunc_end = .;
     *(vtable)
     *(.data*)
     . = ALIGN(4);
@@ -79,6 +81,7 @@ SECTIONS
   } > ram
 
   PROVIDE(_stack_top = __top_ram - 0);
+  ASSERT(LOADADDR(.data) == _etext, "SAMD09 reset copy source must match data load address")
   /* Reserve includes all static RAM, including the reserved boot diagnostics.
      800 bytes is a regression budget, not a measured worst-case stack bound.
      Cortex-M0+ exception frames and nested handlers also use this reserve. */

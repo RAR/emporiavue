@@ -83,6 +83,12 @@ void spi_exit_critical(uint32_t previous) {
         callback();
     }
 }
+unsigned ram_sleep_calls = 0;
+void sleep_and_restore_interrupts_from_ram(uint32_t previous) {
+    assert(primask == 1); // Queue check and WFI entry form one masked section.
+    ++ram_sleep_calls;
+    spi_exit_critical(previous);
+}
 
 #ifdef EMPORIAVUE_TARGET_VUE3
 W1C REG_SERCOM0_STATUS, REG_SERCOM0_INTFLAG;
@@ -100,19 +106,35 @@ uint16_t read_uart_data() {
 
 
 TESTS = r"""
+void test_sleep_decision() {
+    after_snapshot=nullptr;
+    for(unsigned previous : {0U,1U}) {
+        for(unsigned active : {0U,1U}) {
+            for(unsigned ready=0;ready<=SPI_READY_QUEUE_CAPACITY;++ready) {
+                primask=previous; ram_sleep_calls=0;
+                SpiTxActive=active; SpiReadyCount=ready;
+                wait_for_spi_work();
+                assert(ram_sleep_calls==unsigned(active || ready==0));
+                assert(primask==previous); // Both paths restore the original mask exactly once.
+            }
+        }
+    }
+    primask=0;
+}
+
 void test_flash_sleep_configuration() {
     // Reproduce main's temporary startup setting, then the final NVM setup.
     // Changing only main's first write would fail this regression test.
     for(uint32_t initial : {uint32_t(6),uint32_t(0x306),uint32_t(0xffffffff)}) {
         REG_NVMCTRL_CTRLB=initial;
         Config_NVMCTRL();
-        assert(REG_NVMCTRL_CTRLB==0x382);
-        assert(((REG_NVMCTRL_CTRLB>>8)&3)==3); // Flash auto-sleep disabled.
+        assert(REG_NVMCTRL_CTRLB==0x82);
+        assert(((REG_NVMCTRL_CTRLB>>8)&3)==0); // Flash may sleep; wake-up code lives in SRAM.
         assert(((REG_NVMCTRL_CTRLB>>1)&15)==1); // Existing runtime wait states retained.
         assert(REG_NVMCTRL_CTRLB&(1U<<7)); // Manual writes retained.
         assert(!(REG_NVMCTRL_CTRLB&(1U<<18))); // Cache remains enabled.
     }
-    std::puts("Flash wake safeguard: final NVM setup keeps Flash awake; MANW/RWS/cache unchanged");
+    std::puts("SRAM wake experiment: Flash sleep allowed; MANW/RWS/cache unchanged");
 }
 
 void reset_stream() {
@@ -577,6 +599,7 @@ void test_adc_recovery() {
     }
 }
 int main() {
+    test_sleep_decision();
     test_flash_sleep_configuration();
     test_adc_startup();
     test_adc_ping_pong();
@@ -600,6 +623,7 @@ def main() -> None:
     descriptors = source[source.index("struct DMAdescriptorType {"):source.index("#define __SIZE_OF__")]
     names = [
         "Config_NVMCTRL",
+        "wait_for_spi_work",
         "spi_ready_queue_contains", "spi_find_free_build_frame",
         "finalize_spi_frame", "capture_spi_scan",
     ]
