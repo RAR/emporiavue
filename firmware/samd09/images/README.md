@@ -25,3 +25,8 @@ Measured with arm-none-eabi GCC 16.1.0 and the repository Makefile (including re
 Host tests compare two- and six-buffer output byte-for-byte with immediate DMA refill, scan/mux wrap,
 UART updates and fault recovery. Sampling configuration and SPI wire format are unchanged.
 Remaining RAM is a linker measurement, not a measured worst-case stack margin; hardware validation is still required.
+
+All SAMD09 builds now require at least **800 bytes of stack reserve** after all static RAM, including reserved
+boot diagnostics. The linker rejects a smaller reserve, including during incremental builds after linker-script changes.
+Run `python3 tools/test_samd09_ram.py` to check the real linker at the boundary and build all three firmware targets.
+This regression budget does not replace runtime stack measurements or hardware testing.

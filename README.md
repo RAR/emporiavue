@@ -7,7 +7,7 @@ or use the ESPHome SPI path when you specifically want synchronized raw-waveform
 
 | Version | Changes |
 |---|---|
-| 2026.10.3 | Internal SPI firmware RAM optimization for Vue 2 (v1.1) and Vue 3 (v1.2). Sampling, measurement processing and the SPI wire format remain unchanged. Flash the updated SAMD bundled firmware to apply the optimization; no YAML changes required. |
+| 2026.10.3 | Internal SPI firmware RAM optimization for Vue 2 (v1.1) and Vue 3 (v1.2), plus an enforced 800-byte SAMD09 stack-reserve budget and linker regression tests. Sampling, measurement processing and the SPI wire format remain unchanged. Flash the updated SAMD bundled firmware to apply the optimization; no YAML changes required. |
 | 2026.10.2 | Added a lightweight C++ per-metering-frame callback hook for external components, before aggregation and publication, on both I2C and SPI. Added the GPLv3 project license and third-party notices. No YAML changes or SAMD firmware update required. |
 | 2026.10.1 | Added optional SPI `analysis_interval` for duration-weighted P1/Q1 analysis of fundamental reactive power, power factor and displacement angle. Improved daily-energy precision and date-aware restore, stable energy/demand storage keys, acquisition-timed SPI aggregation, fractional RMS and Vue 3 UART reception/diagnostics. **One-time reset:** saved daily energy and daily demand maxima use a new storage format/key. Internal power filters no longer affect apparent power or physical PF. No required YAML changes. |
 | 2026.09.2 | Peak and crest factor now report `unknown` below the current threshold or for inconsistent measurements; sampled short peaks remain unfiltered. No YAML changes required. |

@@ -50,7 +50,7 @@ OBJS = $(addprefix $(BUILD)/, $(notdir %/$(subst .c,.o, $(SRCS))))
 
 all: directory $(BUILD)/$(BIN).elf $(BUILD)/$(BIN).hex $(BUILD)/$(BIN).bin size
 
-$(BUILD)/$(BIN).elf: $(OBJS)
+$(BUILD)/$(BIN).elf: $(OBJS) samd09d14.ld
 	@echo LD $@
 	@$(CC) $(LDFLAGS) $(OBJS) $(LIBS) -o $@
 
