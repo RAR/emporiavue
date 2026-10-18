@@ -10,12 +10,16 @@ Use raw GitHub URLs from a fixed commit or tag when you want reproducible tests.
 
 ## SPI RAM optimization builds
 
-The corrected rebuilds also disable automatic Flash sleep in the final NVM configuration (`CTRLB=0x382`),
-following the SAMD09 Flash-wake erratum workaround (DS80000839B, issue 3). CPU `WFI` remains enabled;
-manual-write mode, runtime Flash wait states and cache settings are unchanged. ADC/DMA/SPI timing is unchanged.
+The corrected rebuilds no longer use CPU `WFI`: the main loop polls (emporiavue#9). On a Vue 3, waking from `WFI`
+while the DMAC was busy made the CPU execute wrong instruction words, a stale Flash word and, with the wake sequence
+in SRAM, the SPI DMA descriptor's first word; both hard-faulted within seconds. Disabling Flash sleep (`CTRLB=0x382`,
+the DS80000839B issue 3 workaround) did not prevent it. The SPI frame CRC-32 is computed from a 256-entry table
+instead of the DMAC CRC engine, which kept frames ready within their period (same IEEE CRC-32 result on the wire).
+The SPI start keeps only the channel-select DMAC accesses inside the interrupt-masked section.
 The image versions remain **Vue 2 v1.1** and **Vue 3 v1.2**, so use a fixed commit or SHA-256 to identify the rebuild.
 After updating ESPHome, manually press **Flash SAMD Bundled Firmware**; a version-only check cannot identify
-an older image with the same version number. Hardware validation of the wake-up safeguard is still required.
+an older image with the same version number. Tested on a Vue 3; the Vue 2 image is built from the same source but
+was not tested on hardware with this change.
 
 `vue2-spi-v1.1.bin` and `vue3-spi-v1.2.bin` retain all three 1,024-byte SPI frame buffers,
 but use two ADC scan buffers instead of the obsolete six-scan history. Delay alignment remains on the ESP32.

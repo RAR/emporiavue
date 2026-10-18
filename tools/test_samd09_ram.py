@@ -89,45 +89,15 @@ def test_firmware_builds(folder):
 
 
 def test_ram_wake_code(elf, values, build, spi):
+    # Vue 3 must never execute WFI (emporiavue#9): after waking with the DMAC busy the
+    # CPU fetched wrong instruction words, from Flash and even from SRAM. The SPI
+    # builds therefore poll; nothing runs from SRAM and no WFI instruction is linked.
     name = "sleep_and_restore_interrupts_from_ram"
-    if not spi:
-        assert values["_ramfunc_start"] == values["_ramfunc_end"]
-        assert name not in values
-        return
-    start, end = values["_ramfunc_start"], values["_ramfunc_end"]
-    assert 0x20000000 <= start <= values[name] < end <= values["_bss"]
-    assert values["_data"] <= start < end <= values["_edata"]
-    disassembly = run([*OBJDUMP, "-d", str(elf)], check=True).stdout
-    wfi_addresses = [int(address, 16) for address in
-                     re.findall(r"^\s*([0-9a-f]+):[^\n]*\twfi\s*$", disassembly, re.M)]
-    assert len(wfi_addresses) == 1 and start <= wfi_addresses[0] < end, wfi_addresses
-    block = re.search(rf"^[0-9a-f]+ <{name}>:\n(.*?)(?=\n[0-9a-f]+ <|\Z)",
-                      disassembly, re.M | re.S)
-    assert block, "SRAM wake function missing from ARM disassembly"
-    instructions = []
-    for line in block.group(1).splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 3 and parts[0].strip().endswith(":"):
-            instructions.append((parts[2].strip(), " ".join(parts[3:]).split("@")[0].strip()))
-    # The entire wake sequence must execute in SRAM, without Flash calls,
-    # literal-pool reads, stack use or interrupt restore before Flash is ready.
-    expected = ["dsb", "wfi", "movs", "ldr", "movs", "ldr", "dsb", "isb", "msr", "bx"]
-    assert [op for op, _ in instructions] == expected, instructions
-    assert instructions[2][1] == "r1, #64", instructions
-    assert instructions[3][1] == "r2, [r1, #0]", instructions
-    assert instructions[4][1] == "r1, #128", instructions
-    assert instructions[5][1] == "r2, [r1, #0]", instructions
-    assert instructions[8][1].startswith("PRIMASK, "), instructions
-    assert instructions[9][1] == "lr", instructions
-    # Verify the initial Flash image actually contains the RAM code at the
-    # address used by irq_handler_reset's _etext -> _data copy loop.
-    data_file = build / "initialized-data.bin"
-    run([*OBJCOPY, f"--dump-section=.data={data_file}", str(elf)], check=True)
-    data = data_file.read_bytes()
-    image = (build / "EmporiaSamd09.bin").read_bytes()
-    assert image[values["_etext"]:values["_etext"] + len(data)] == data
-    assert len(data) == values["_edata"] - values["_data"]
-    print(f"PASS SRAM wake: {end-start} bytes, two Flash reads before PRIMASK/return, correct reset-copy image")
+    assert values["_ramfunc_start"] == values["_ramfunc_end"]
+    assert name not in values
+    if spi:
+        disassembly = run([*OBJDUMP, "-d", str(elf)], check=True).stdout
+        assert not re.search(r"\twfi\s*$", disassembly, re.M), "SPI firmware must not contain WFI"
 
 
 def main():
