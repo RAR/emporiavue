@@ -1020,21 +1020,27 @@ static void spi_frame_cs_assert(void)
 
 static void spi_frame_cs_deassert(void)
 {
-	spi_frame_guard_delay();
+	// Callers either observed TXC or explicitly abort the transfer. Release
+	// CS promptly; CRC/setup work provides the next frame's idle-high time.
 	REG_PORT_OUTSET = SPI_FRAME_CS_PIN_MASK;
 }
 
 static void finish_spi_tx(void)
 {
 	REG_SERCOM1_INTENCLR = SERCOM_INT_TXC;
+	const bool transfer_complete = SpiTxActive && SpiTxAwaitingComplete;
+	if (transfer_complete)
+		spi_frame_cs_deassert();
+
+	// Acknowledge/drain SERCOM only after ending the wire transaction. The
+	// frame remains owned until the queue update below completes.
 	REG_SERCOM1_INTFLAG = SERCOM_INT_TXC;
 	if ((REG_SERCOM1_INTFLAG & SERCOM_INT_RXC) != 0)
 		(void) REG_SERCOM1_DATA;
 
-	if (!SpiTxActive || !SpiTxAwaitingComplete)
+	if (!transfer_complete)
 		return;
 
-	spi_frame_cs_deassert();
 	const uint32_t primask = spi_enter_critical();
 	if (SpiReadyCount != 0)
 	{
@@ -1077,6 +1083,18 @@ static void start_spi_dma_if_ready(void)
 	descriptor->DESCADDR = 0;
 	__asm__ __volatile__("dmb sy" ::: "memory");
 
+	// Only main starts a transfer. With SpiTxActive clear, the ADC ISR may
+	// append a ready frame but cannot remove or modify the selected head.
+	// Keep SERCOM housekeeping and the CS setup delay interruptible so ADC
+	// DMA can be rearmed promptly, even if it completes during this setup.
+	REG_SERCOM1_INTENCLR = SERCOM_INT_TXC;
+	REG_SERCOM1_INTFLAG = SERCOM_INT_TXC;
+	if ((REG_SERCOM1_INTFLAG & SERCOM_INT_RXC) != 0)
+		(void) REG_SERCOM1_DATA;
+	spi_frame_cs_assert();
+
+	// CHID is shared with the ADC ISR: select and access the SPI channel only
+	// inside this short critical section, after all interruptible setup.
 	const uint32_t primask = spi_enter_critical();
 	REG_DMAC_CHID = DMA_CHANNEL_SPI_TX;
 	const uint32_t spi_dma_mask = 1UL << DMA_CHANNEL_SPI_TX;
@@ -1085,17 +1103,13 @@ static void start_spi_dma_if_ready(void)
 	{
 		SpiPendingFlags |= SPI_FLAG_DMA_ERROR;
 		spi_exit_critical(primask);
+		spi_frame_cs_deassert();
 		return;
 	}
 
 	REG_DMAC_CHINTFLAG = DMA_INT_TRANSFER_ERROR | DMA_INT_TRANSFER_COMPLETE | DMA_INT_SUSPEND;
-	REG_SERCOM1_INTENCLR = SERCOM_INT_TXC;
-	REG_SERCOM1_INTFLAG = SERCOM_INT_TXC;
-	if ((REG_SERCOM1_INTFLAG & SERCOM_INT_RXC) != 0)
-		(void) REG_SERCOM1_DATA;
 	SpiTxAwaitingComplete = false;
 	SpiTxActive = true;
-	spi_frame_cs_assert();
 	REG_DMAC_CHCTRLA = DMA_CHANNEL_ENABLE;
 	spi_exit_critical(primask);
 }
@@ -1268,8 +1282,9 @@ void ConfigureTimerCounter1 () {
 
 void Config_NVMCTRL ()
 {
-	// MANW=1, RWS=1; permit Flash sleep. The complete wake-up sequence runs
-	// from SRAM and forces Flash awake before interrupts/Flash code resume.
+	// MANW=1, RWS=1, SLEEPPRM=WAKEONACCESS. Allow Flash to sleep; the SRAM
+	// wake-up sequence restores Flash access before unmasking interrupts.
+	// Keep SPI setup interruptible so ADC DMA rearming is not delayed there.
 	REG_NVMCTRL_CTRLB = 0x82;
 }
 

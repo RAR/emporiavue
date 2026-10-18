@@ -264,7 +264,7 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
   bus_config.sclk_io_num = this->spi_clk_pin_;
   bus_config.quadwp_io_num = -1;
   bus_config.quadhd_io_num = -1;
-  bus_config.max_transfer_sz = SPI_RAW_FRAME_SIZE;
+  bus_config.max_transfer_sz = SPI_RX_BUFFER_SIZE;
 
   spi_slave_interface_config_t slave_config{};
   slave_config.spics_io_num = this->spi_frame_pin_;
@@ -370,7 +370,7 @@ void EmporiaVueComponent::setup_spi_receiver_(bool reset_statistics) {
   this->spi_rx_inflight_ = 0;
 
   for (uint8_t index = 0; index < SPI_RX_QUEUE_SIZE; index++) {
-    this->spi_rx_buffers_[index] = static_cast<uint8_t *>(heap_caps_malloc(SPI_RAW_FRAME_SIZE, MALLOC_CAP_DMA));
+    this->spi_rx_buffers_[index] = static_cast<uint8_t *>(heap_caps_malloc(SPI_RX_BUFFER_SIZE, MALLOC_CAP_DMA));
     if (this->spi_rx_buffers_[index] == nullptr) {
       ESP_LOGE(TAG, "SAMD09 SPI receiver buffer allocation failed");
       cleanup_spi_init();
@@ -637,7 +637,7 @@ bool EmporiaVueComponent::queue_spi_receive_(uint8_t index) {
     return false;
   }
   std::memset(&this->spi_transactions_[index], 0, sizeof(this->spi_transactions_[index]));
-  this->spi_transactions_[index].length = SPI_RAW_FRAME_SIZE * 8;
+  this->spi_transactions_[index].length = SPI_RX_BUFFER_SIZE * 8;
   this->spi_transactions_[index].rx_buffer = this->spi_rx_buffers_[index];
   this->spi_dma_slots_[index].index = index;
   this->spi_dma_slots_[index].completed_ms = 0;
@@ -658,7 +658,7 @@ bool EmporiaVueComponent::queue_spi_receive_(uint8_t index) {
 
 #ifdef USE_ESP32
 void IRAM_ATTR EmporiaVueComponent::spi_transaction_completed_(spi_slave_transaction_t *transaction) {
-  // Called by the driver immediately after DMA completion, before queuing the
+  // Called by the driver at transaction completion, before queuing the
   // result for the receive task. Keep this ISR callback bounded and IRAM-safe.
   if (transaction != nullptr && transaction->user != nullptr) {
     static_cast<SpiDmaSlot *>(transaction->user)->completed_ms = millis();

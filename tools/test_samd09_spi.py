@@ -34,26 +34,127 @@ MOCKS = r"""
 #include <cstdio>
 #include <deque>
 
+unsigned primask = 0;
+bool track_spi_start = false;
+bool track_spi_finish = false;
+bool finish_expects_cs_release = false;
+unsigned spi_entry_primask = 0, spi_critical_depth = 0;
+unsigned spi_critical_entries = 0, spi_dma_enables = 0, spi_dma_flag_clears = 0;
+unsigned spi_sercom_reads = 0, spi_sercom_flag_clears = 0, spi_sercom_interrupt_disables = 0;
+unsigned spi_cs_asserts = 0, spi_cs_deasserts = 0;
+bool spi_cs_low = false;
+void (*during_spi_guard)() = nullptr;
+void (*after_spi_cs_release)() = nullptr;
+uint8_t spi_tx_irq_enabled = 0;
+unsigned spi_tx_irq_enables = 0, spi_dma_disables = 0;
+void assert_spi_setup_unmasked() {
+    assert(track_spi_start && spi_critical_depth == 0);
+    assert(primask == spi_entry_primask); // Never enable interrupts disabled by the caller.
+}
+
 // SAMD INTFLAG/STATUS registers clear bits written as one.
 struct W1C {
     uint16_t value = 0;
     operator uint16_t() const { return value; }
     void operator=(uint16_t bits) { value &= ~bits; }
 };
-W1C REG_ADC_INTFLAG, REG_TC1_INTFLAG, REG_DMAC_CHINTFLAG;
+W1C REG_ADC_INTFLAG, REG_TC1_INTFLAG;
 uint16_t REG_TC1_CTRLA = 2;
 uint8_t REG_TC1_STATUS = 0, REG_ADC_STATUS = 0, REG_ADC_CTRLA = 2;
 uint8_t REG_DMAC_CHID = 0;
 void (*after_adc_dma_enabled)() = nullptr;
 struct DmaEnableRegister {
-    uint8_t value = 2;
-    operator uint8_t() const { return value; }
+    uint8_t values[2] = {2,0};
+    operator uint8_t() const {
+        if (track_spi_start) assert(spi_critical_depth == 1 && REG_DMAC_CHID == 1);
+        return values[REG_DMAC_CHID];
+    }
     DmaEnableRegister &operator=(uint8_t bits) {
-        value = bits;
-        if (bits == 2 && after_adc_dma_enabled) after_adc_dma_enabled();
+        if (track_spi_start) {
+            assert(spi_critical_depth == 1 && REG_DMAC_CHID == 1 && spi_cs_low);
+            if (bits == 2) ++spi_dma_enables;
+        }
+        if (track_spi_finish && REG_DMAC_CHID == 1 && bits == 0) {
+            // The shared DMA ISR already owns CHID. An error must stop DMA
+            // before releasing CS without adding a masked polling section.
+            assert(spi_cs_low && spi_critical_depth == 0);
+            ++spi_dma_disables;
+        }
+        values[REG_DMAC_CHID] = bits;
+        if (REG_DMAC_CHID == 0 && bits == 2 && after_adc_dma_enabled) after_adc_dma_enabled();
         return *this;
     }
 } REG_DMAC_CHCTRLA;
+struct DmaInterruptFlags : W1C {
+    void operator=(uint16_t bits) {
+        if (track_spi_start) {
+            assert(spi_critical_depth == 1 && REG_DMAC_CHID == 1);
+            ++spi_dma_flag_clears;
+        }
+        W1C::operator=(bits);
+    }
+} REG_DMAC_CHINTFLAG;
+uint32_t REG_DMAC_BUSYCH = 0, REG_DMAC_PENDCH = 0;
+
+struct SpiInterruptFlags : W1C {
+    operator uint16_t() const {
+        if (track_spi_start) assert_spi_setup_unmasked();
+        return value;
+    }
+    void operator=(uint16_t bits) {
+        if (track_spi_start) { assert_spi_setup_unmasked(); ++spi_sercom_flag_clears; }
+        if (track_spi_finish) {
+            if (finish_expects_cs_release) assert(!spi_cs_low && spi_cs_deasserts == 1);
+            assert(spi_critical_depth == 0);
+            ++spi_sercom_flag_clears;
+        }
+        W1C::operator=(bits);
+    }
+} REG_SERCOM1_INTFLAG;
+struct SpiInterruptDisable {
+    uint8_t value = 0;
+    void operator=(uint8_t bits) {
+        if (track_spi_start) { assert_spi_setup_unmasked(); ++spi_sercom_interrupt_disables; }
+        if (track_spi_finish) { assert(spi_critical_depth == 0); ++spi_sercom_interrupt_disables; }
+        spi_tx_irq_enabled &= uint8_t(~bits);
+        value = bits;
+    }
+} REG_SERCOM1_INTENCLR;
+struct SpiInterruptEnable {
+    void operator=(uint8_t bits) {
+        assert(track_spi_finish && spi_critical_depth == 0);
+        spi_tx_irq_enabled |= bits;
+        ++spi_tx_irq_enables;
+    }
+} REG_SERCOM1_INTENSET;
+struct SpiDataRegister {
+    operator uint16_t() const {
+        if (track_spi_start) { assert_spi_setup_unmasked(); ++spi_sercom_reads; }
+        if (track_spi_finish) {
+            if (finish_expects_cs_release) assert(!spi_cs_low && spi_cs_deasserts == 1);
+            assert(spi_critical_depth == 0);
+            ++spi_sercom_reads;
+        }
+        REG_SERCOM1_INTFLAG.value &= ~4U;
+        return 0;
+    }
+} REG_SERCOM1_DATA;
+
+uint32_t mock_crc = 0;
+unsigned crc_begin_calls = 0, crc_byte_calls = 0, crc_end_calls = 0;
+void crc32_hardware_begin() {
+    assert_spi_setup_unmasked(); ++crc_begin_calls; mock_crc = 0xffffffffU;
+}
+void crc32_hardware_update_byte(uint8_t value) {
+    assert_spi_setup_unmasked(); ++crc_byte_calls; mock_crc ^= value;
+    for (unsigned bit=0;bit<8;++bit)
+        mock_crc = (mock_crc >> 1) ^ ((mock_crc & 1) ? 0xedb88320U : 0);
+}
+uint32_t crc32_hardware_end() {
+    assert_spi_setup_unmasked(); ++crc_end_calls; return mock_crc ^ 0xffffffffU;
+}
+void spi_frame_cs_assert();
+void spi_frame_cs_deassert();
 uint16_t REG_ADC_RESULT = 0;
 uint32_t REG_PORT_OUT = 0, REG_PORT_OUTSET = 0, REG_PORT_OUTCLR = 0;
 uint32_t REG_NVMCTRL_CTRLB = 0;
@@ -68,14 +169,22 @@ void adc_config() {
     ++adc_resets;
 }
 
-unsigned primask = 0;
 void (*after_snapshot)() = nullptr;
 uint32_t spi_enter_critical() {
+    if (track_spi_start || track_spi_finish) {
+        assert(spi_critical_depth == 0);
+        ++spi_critical_depth;
+        ++spi_critical_entries;
+    }
     unsigned previous = primask;
     primask = 1;
     return previous;
 }
 void spi_exit_critical(uint32_t previous) {
+    if (track_spi_start || track_spi_finish) {
+        assert(spi_critical_depth == 1);
+        --spi_critical_depth;
+    }
     primask = previous;
     if (!primask && after_snapshot) {
         auto callback = after_snapshot;
@@ -129,15 +238,16 @@ void test_flash_sleep_configuration() {
         REG_NVMCTRL_CTRLB=initial;
         Config_NVMCTRL();
         assert(REG_NVMCTRL_CTRLB==0x82);
-        assert(((REG_NVMCTRL_CTRLB>>8)&3)==0); // Flash may sleep; wake-up code lives in SRAM.
+        assert(((REG_NVMCTRL_CTRLB>>8)&3)==0); // Flash may sleep; SRAM WFI workaround remains.
         assert(((REG_NVMCTRL_CTRLB>>1)&15)==1); // Existing runtime wait states retained.
         assert(REG_NVMCTRL_CTRLB&(1U<<7)); // Manual writes retained.
         assert(!(REG_NVMCTRL_CTRLB&(1U<<18))); // Cache remains enabled.
     }
-    std::puts("SRAM wake experiment: Flash sleep allowed; MANW/RWS/cache unchanged");
+    std::puts("SRAM wake retained: Flash may sleep; MANW/RWS/cache unchanged");
 }
 
 void reset_stream() {
+    assert(!track_spi_start);
     after_adc_dma_enabled = nullptr;
     SpiBuildFrameIndex = SpiReadyHead = SpiReadyCount = SpiBuildScanIndex = 0;
     SpiFrameSequence = SpiPendingFlags = 0;
@@ -146,9 +256,228 @@ void reset_stream() {
     DiscardNextAdcScan = false;
     dmabool = true;
     REG_ADC_INTFLAG.value = 0;
+    REG_DMAC_CHID = DMA_CHANNEL_ADC;
     REG_TC1_CTRLA = REG_ADC_CTRLA = REG_DMAC_CHCTRLA = 2;
     adc_resets = 0;
     adc_pin_offset = 3;
+}
+
+void spi_frame_cs_assert() {
+    assert_spi_setup_unmasked();
+    ++spi_cs_asserts;
+    assert(!spi_cs_low);
+    spi_cs_low = true;
+    if (during_spi_guard && primask == 0) during_spi_guard();
+}
+void spi_frame_cs_deassert() {
+    if (track_spi_start) assert_spi_setup_unmasked();
+    else assert(track_spi_finish && spi_critical_depth == 0);
+    ++spi_cs_deasserts;
+    assert(spi_cs_low);
+    spi_cs_low = false;
+    if (after_spi_cs_release && primask == 0) after_spi_cs_release();
+}
+
+void reset_spi_start(unsigned previous) {
+    track_spi_start = false;
+    track_spi_finish = false;
+    reset_stream();
+    SpiTxActive = SpiTxAwaitingComplete = false;
+    SpiReadyFrameIndex[0] = 1;
+    SpiReadyFrameIndex[1] = 2;
+    SpiReadyCount = 1;
+    SpiBuildFrameIndex = 0;
+    for (unsigned index=0;index<SPI_FRAME_SIZE;++index)
+        reinterpret_cast<uint8_t*>(&SpiFrames[1])[index] = uint8_t(index * 37 + 11);
+    REG_DMAC_CHCTRLA.values[DMA_CHANNEL_SPI_TX] = 0;
+    REG_DMAC_BUSYCH = REG_DMAC_PENDCH = 0;
+    REG_DMAC_CHINTFLAG.value = 7;
+    REG_SERCOM1_INTFLAG.value = SERCOM_INT_TXC | SERCOM_INT_RXC;
+    REG_SERCOM1_INTENCLR.value = 0;
+    spi_critical_depth = spi_critical_entries = spi_dma_enables = spi_dma_flag_clears = 0;
+    spi_sercom_reads = spi_sercom_flag_clears = spi_sercom_interrupt_disables = 0;
+    spi_cs_asserts = spi_cs_deasserts = 0;
+    crc_begin_calls = crc_byte_calls = crc_end_calls = 0;
+    during_spi_guard = after_snapshot = nullptr;
+    after_spi_cs_release = nullptr;
+    spi_cs_low = false;
+    primask = spi_entry_primask = previous;
+    track_spi_start = true;
+}
+
+void simulate_adc_during_spi_guard() {
+    assert(primask == 0 && spi_critical_depth == 0 && spi_cs_low);
+    // An ADC interrupt selects its DMA channel and may append a new frame.
+    // SPI startup must reselect channel 1 *after* this unmasked guard period.
+    REG_DMAC_CHID = DMA_CHANNEL_ADC;
+    SpiReadyCount = 2;
+}
+
+void test_spi_start_critical_scope() {
+    for (unsigned previous : {0U,1U}) {
+        for (unsigned preempt : {0U,1U}) {
+            reset_spi_start(previous);
+            if (preempt) during_spi_guard = simulate_adc_during_spi_guard;
+            start_spi_dma_if_ready();
+            assert(primask == previous && spi_critical_depth == 0);
+            assert(spi_critical_entries == 1 && spi_dma_enables == 1 && spi_dma_flag_clears == 1);
+            assert(spi_sercom_interrupt_disables == 1 && spi_sercom_flag_clears == 1 && spi_sercom_reads == 1);
+            assert(spi_cs_asserts == 1 && spi_cs_deasserts == 0 && spi_cs_low);
+            assert(crc_begin_calls == 1 && crc_byte_calls == SPI_FRAME_SIZE-SPI_CRC_SIZE && crc_end_calls == 1);
+            assert(SpiFrames[1].crc32 == (mock_crc ^ 0xffffffffU));
+            assert(SpiTxActive && !SpiTxAwaitingComplete && SpiPendingFlags == 0);
+            assert(SpiReadyHead == 0 && SpiReadyFrameIndex[0] == 1);
+            assert(SpiReadyCount == ((preempt && !previous) ? 2 : 1));
+            assert(REG_DMAC_CHID == DMA_CHANNEL_SPI_TX);
+            assert(REG_DMAC_CHCTRLA.values[DMA_CHANNEL_ADC] == DMA_CHANNEL_ENABLE);
+            const auto &descriptor = DMAdescriptor[DMA_CHANNEL_SPI_TX];
+            assert(descriptor.BTCTRL == 0x409 && descriptor.BTCNT == SPI_FRAME_SIZE);
+            assert(descriptor.SRCADDR == uint32_t(uintptr_t(&SpiFrames[1])) + SPI_FRAME_SIZE);
+            assert(descriptor.DSTADDR == uint32_t(uintptr_t(&REG_SERCOM1_DATA)) && descriptor.DESCADDR == 0);
+            track_spi_start = false;
+        }
+
+        // Every independent busy condition must leave the frame queued and CS
+        // high. The cleanup delay must be outside the masked DMAC section too.
+        for (unsigned busy=0;busy<3;++busy) {
+            reset_spi_start(previous);
+            if (busy == 0) REG_DMAC_CHCTRLA.values[DMA_CHANNEL_SPI_TX] = DMA_CHANNEL_ENABLE;
+            if (busy == 1) REG_DMAC_BUSYCH = 1U << DMA_CHANNEL_SPI_TX;
+            if (busy == 2) REG_DMAC_PENDCH = 1U << DMA_CHANNEL_SPI_TX;
+            start_spi_dma_if_ready();
+            assert(primask == previous && spi_critical_depth == 0 && spi_critical_entries == 1);
+            assert(!SpiTxActive && !SpiTxAwaitingComplete && !spi_cs_low);
+            assert(spi_cs_asserts == 1 && spi_cs_deasserts == 1);
+            assert(spi_dma_enables == 0 && spi_dma_flag_clears == 0);
+            assert(SpiReadyHead == 0 && SpiReadyCount == 1 && SpiReadyFrameIndex[0] == 1);
+            assert(SpiPendingFlags == SPI_FLAG_DMA_ERROR);
+            track_spi_start = false;
+        }
+
+        for (unsigned active : {0U,1U}) {
+            for (unsigned ready : {0U,1U}) {
+                if (!active && ready) continue;
+                reset_spi_start(previous);
+                SpiTxActive = active;
+                SpiReadyCount = ready;
+                start_spi_dma_if_ready();
+                assert(primask == previous && spi_critical_entries == 0);
+                assert(crc_begin_calls == 0 && spi_cs_asserts == 0 && spi_dma_enables == 0);
+                assert(SpiTxActive == bool(active) && SpiReadyCount == ready);
+                track_spi_start = false;
+            }
+        }
+    }
+    primask = 0;
+    std::puts("SPI startup: unmasked CRC/SERCOM/CS guard, protected DMA selection, preemption and busy cleanup passed");
+}
+
+void reset_spi_finish(unsigned previous, uint8_t head, unsigned ready=2) {
+    reset_spi_start(previous);
+    track_spi_start = false;
+    track_spi_finish = true;
+    finish_expects_cs_release = true;
+    SpiTxActive = SpiTxAwaitingComplete = true;
+    SpiReadyHead = head;
+    SpiReadyCount = ready;
+    SpiReadyFrameIndex[head] = 1;
+    SpiReadyFrameIndex[(head + 1) % SPI_READY_QUEUE_CAPACITY] = 2;
+    spi_cs_asserts = 1;
+    spi_cs_low = true;
+    spi_tx_irq_enabled = SERCOM_INT_TXC;
+    spi_tx_irq_enables = spi_dma_disables = 0;
+    REG_DMAC_CHID = DMA_CHANNEL_SPI_TX;
+    REG_DMAC_CHCTRLA.values[DMA_CHANNEL_SPI_TX] = 0;
+    REG_SERCOM1_INTFLAG.value = SERCOM_INT_TXC | SERCOM_INT_RXC;
+}
+
+void assert_spi_finished(unsigned previous, uint8_t old_head, unsigned remaining) {
+    assert(primask == previous && spi_critical_depth == 0);
+    assert(!SpiTxActive && !SpiTxAwaitingComplete && !spi_cs_low);
+    assert(SpiReadyHead == (old_head + 1) % SPI_READY_QUEUE_CAPACITY);
+    assert(SpiReadyCount == remaining && spi_cs_deasserts == 1);
+    assert(spi_critical_entries == 1);
+    assert(spi_tx_irq_enabled == 0);
+    assert(spi_sercom_interrupt_disables == 1 && spi_sercom_flag_clears == 1 && spi_sercom_reads == 1);
+    assert(!(REG_SERCOM1_INTFLAG.value & (SERCOM_INT_TXC | SERCOM_INT_RXC)));
+}
+
+void append_ready_frame_after_cs_release() {
+    assert(primask == 0 && spi_critical_depth == 0 && !spi_cs_low);
+    // ADC may preempt the lower-priority TXC handler after the atomic GPIO
+    // release, while the old queue head is still reserved for this transfer.
+    assert(SpiTxActive && SpiTxAwaitingComplete && SpiReadyCount == 1);
+    const unsigned tail = (SpiReadyHead + SpiReadyCount) % SPI_READY_QUEUE_CAPACITY;
+    SpiReadyFrameIndex[tail] = 2;
+    ++SpiReadyCount;
+    after_spi_cs_release = nullptr;
+}
+
+void test_spi_completion_boundary() {
+    for (unsigned previous : {0U,1U}) {
+        for (uint8_t head=0;head<SPI_READY_QUEUE_CAPACITY;++head) {
+            reset_spi_finish(previous, head);
+            SpiTxAwaitingComplete = false;
+            REG_SERCOM1_INTFLAG.value = SERCOM_INT_RXC;
+            spi_tx_irq_enabled = 0;
+            // DMA completion means final DATA write, not final SCK edge. It
+            // must only arm TXC, with no CS change, queue pop or busy-wait.
+            handle_spi_tx_dma_interrupt(DMA_INT_TRANSFER_COMPLETE);
+            assert(SpiTxActive && SpiTxAwaitingComplete && spi_cs_low);
+            assert(SpiReadyHead == head && SpiReadyCount == 2);
+            assert(spi_cs_deasserts == 0 && spi_critical_entries == 0);
+            assert(spi_tx_irq_enables == 1 && spi_tx_irq_enabled == SERCOM_INT_TXC);
+            assert(spi_sercom_flag_clears == 0 && spi_sercom_reads == 0);
+            // Any number of ISR checks before actual TXC leaves the wire and
+            // queue unchanged. Only real TXC may finish the transaction.
+            for (unsigned delay=0;delay<100;++delay) irq_handler_sercom1();
+            assert(spi_cs_low && SpiReadyCount == 2 && spi_cs_deasserts == 0);
+            REG_SERCOM1_INTFLAG.value |= SERCOM_INT_TXC;
+            irq_handler_sercom1();
+            assert_spi_finished(previous, head, 1);
+            assert(SpiReadyFrameIndex[SpiReadyHead] == 2 && SpiPendingFlags == 0);
+            // A pending duplicate TXC IRQ must not free the following frame.
+            finish_expects_cs_release = false;
+            REG_SERCOM1_INTFLAG.value = SERCOM_INT_TXC | SERCOM_INT_RXC;
+            irq_handler_sercom1();
+            assert(SpiReadyCount == 1 && SpiReadyFrameIndex[SpiReadyHead] == 2);
+            assert(spi_cs_deasserts == 1 && spi_critical_entries == 1);
+            track_spi_finish = false;
+        }
+
+        // A spurious/stale TXC while a new DMA transfer is still running
+        // may acknowledge flags, but cannot release its CS or queue slot.
+        reset_spi_finish(previous, 0);
+        SpiTxAwaitingComplete = false;
+        finish_expects_cs_release = false;
+        irq_handler_sercom1();
+        assert(SpiTxActive && !SpiTxAwaitingComplete && spi_cs_low);
+        assert(SpiReadyHead == 0 && SpiReadyCount == 2);
+        assert(spi_cs_deasserts == 0 && spi_critical_entries == 0);
+        track_spi_finish = false;
+
+        // Explicit DMA errors/partial completion abort without waiting for
+        // TXC, which need not ever assert if DATA was never written.
+        for (uint8_t flags : {uint8_t(DMA_INT_TRANSFER_ERROR),uint8_t(DMA_INT_SUSPEND),uint8_t(0)}) {
+            reset_spi_finish(previous, 1);
+            SpiTxAwaitingComplete = false;
+            REG_SERCOM1_INTFLAG.value = SERCOM_INT_RXC;
+            handle_spi_tx_dma_interrupt(flags);
+            assert_spi_finished(previous, 1, 1);
+            assert(spi_dma_disables == 1 && spi_tx_irq_enables == 0);
+            assert(SpiPendingFlags == SPI_FLAG_DMA_ERROR);
+            track_spi_finish = false;
+        }
+    }
+
+    reset_spi_finish(0, 1, 1);
+    after_spi_cs_release = append_ready_frame_after_cs_release;
+    irq_handler_sercom1();
+    assert_spi_finished(0, 1, 1);
+    assert(SpiReadyFrameIndex[SpiReadyHead] == 2 && SpiPendingFlags == 0);
+    track_spi_finish = false;
+    primask = 0;
+    std::puts("SPI completion: actual TXC boundary, immediate CS before cleanup, delayed/duplicate IRQs, ADC preemption and DMA aborts passed");
 }
 
 void test_adc_startup() {
@@ -601,6 +930,8 @@ void test_adc_recovery() {
 int main() {
     test_sleep_decision();
     test_flash_sleep_configuration();
+    test_spi_start_critical_scope();
+    test_spi_completion_boundary();
     test_adc_startup();
     test_adc_ping_pong();
     test_queue_error_retention();
@@ -626,6 +957,8 @@ def main() -> None:
         "wait_for_spi_work",
         "spi_ready_queue_contains", "spi_find_free_build_frame",
         "finalize_spi_frame", "capture_spi_scan",
+        "start_spi_dma_if_ready",
+        "finish_spi_tx", "irq_handler_sercom1", "handle_spi_tx_dma_interrupt",
     ]
     common = "\n".join([
         "#ifdef EMPORIAVUE_TARGET_VUE3",
@@ -633,6 +966,11 @@ def main() -> None:
         "#endif",
         *(function(source, name) for name in names),
     ])
+    cs_release = function(source, "spi_frame_cs_deassert")
+    cs_release = re.sub(r"//[^\n]*|/\*.*?\*/", "", cs_release, flags=re.S)
+    assert re.sub(r"\s+", " ", cs_release).strip() == (
+        "static void spi_frame_cs_deassert(void) { REG_PORT_OUTSET = SPI_FRAME_CS_PIN_MASK; }"
+    ), "CS release must be one atomic GPIO write, without a post-transfer delay"
     uart = "\n".join(function(source, name) for name in ["irq_handler_sercom0", "decode_vue3_voltage_packet"])
     adc = "\n".join(function(source, name) for name in ["prepare_adc_scan_start", "enable_adc_dma", "recover_adc_scan", "handle_adc_dma_interrupt"])
     program = "\n".join([
@@ -641,6 +979,10 @@ def main() -> None:
     ])
     program = re.sub(r'__asm__ __volatile__\("dmb sy"(?: ::: "memory")?\);', '(void) 0;', program)
     program = program.replace("(uint32_t) &", "(uint32_t) (uintptr_t) &")
+    program = program.replace("(uint32_t) bytes", "(uint32_t) (uintptr_t) bytes")
+    # Discarding a hardware integer lvalue reads DATA; discarding a C++ proxy
+    # object does not invoke its conversion, so make that MMIO read explicit.
+    program = program.replace("(void) REG_SERCOM1_DATA;", "(void) uint16_t(REG_SERCOM1_DATA);")
     with tempfile.TemporaryDirectory(prefix="samd09-spi-tests-") as directory:
         for hardware in (2, 3):
             defines = ["-DEMPORIAVUE_TARGET_VUE3=1"] if hardware == 3 else []
@@ -655,7 +997,10 @@ def main() -> None:
                     "-x", "c++", "-", "-o", str(output),
                 ]
                 subprocess.run(command, input=variant, text=True, check=True)
-                results.append(subprocess.run([str(output)], text=True, capture_output=True, check=True).stdout)
+                result = subprocess.run([str(output)], text=True, capture_output=True)
+                if result.returncode:
+                    raise AssertionError(f"{output.name} failed ({result.returncode}):\n{result.stdout}{result.stderr}")
+                results.append(result.stdout)
             assert results[0] == results[1], "Two- and six-buffer results differ"
             print(f"Vue {hardware}:", flush=True)
             print(results[0], end="")

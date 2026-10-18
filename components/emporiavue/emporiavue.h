@@ -43,6 +43,10 @@ static constexpr float VUE2_STOCK_CYCLE_TIMEBASE_HZ = 25310.0f;
 static constexpr float VUE3_STOCK_CYCLE_TIMEBASE_HZ = 19610.0f;
 static constexpr uint8_t SPI_RX_QUEUE_SIZE = 16;
 static constexpr uint16_t SPI_RAW_FRAME_SIZE = 1024;
+// Keep the DMA capacity above the wire-frame size: CS, not the programmed
+// bit limit, should end a valid frame, and extra clocks must remain detectable.
+static constexpr uint16_t SPI_RX_BUFFER_SIZE = SPI_RAW_FRAME_SIZE + 4;
+static_assert(SPI_RX_BUFFER_SIZE % 4 == 0, "SPI RX DMA capacity must be word-aligned");
 static constexpr uint8_t SPI_PROCESSING_FRAME_COUNT = SPI_RX_QUEUE_SIZE;
 // Voltage THD uses the conventional harmonic range H2 through H40.
 static constexpr uint8_t SPI_VOLTAGE_THD_MAX_HARMONIC = 40;
