@@ -10,6 +10,13 @@ Use raw GitHub URLs from a fixed commit or tag when you want reproducible tests.
 
 ## SPI RAM optimization builds
 
+The corrected rebuilds also disable automatic Flash sleep in the final NVM configuration (`CTRLB=0x382`),
+following the SAMD09 Flash-wake erratum workaround (DS80000839B, issue 3). CPU `WFI` remains enabled;
+manual-write mode, runtime Flash wait states and cache settings are unchanged. ADC/DMA/SPI timing is unchanged.
+The image versions remain **Vue 2 v1.1** and **Vue 3 v1.2**, so use a fixed commit or SHA-256 to identify the rebuild.
+After updating ESPHome, manually press **Flash SAMD Bundled Firmware**; a version-only check cannot identify
+an older image with the same version number. Hardware validation of the wake-up safeguard is still required.
+
 `vue2-spi-v1.1.bin` and `vue3-spi-v1.2.bin` retain all three 1,024-byte SPI frame buffers,
 but use two ADC scan buffers instead of the obsolete six-scan history. Delay alignment remains on the ESP32.
 An unused internal overrun counter was removed; the transmitted overrun flag is unchanged.

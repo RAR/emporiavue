@@ -1248,7 +1248,10 @@ void ConfigureTimerCounter1 () {
 
 void Config_NVMCTRL ()
 {
-	REG_NVMCTRL_CTRLB = 0x82; //1000 0010, Write commands must be issued through the CMD register. 1 wait states for a read operation
+	// Keep Flash awake while the CPU uses WFI (SAMD09 errata DS80000839B,
+	// issue 3). Set this in the final configuration, not just the startup write
+	// in main(): MANW=1, RWS=1 unchanged; SLEEPPRM=DISABLED (bits 9:8 = 3).
+	REG_NVMCTRL_CTRLB = 0x382;
 }
 
 void config_EventSystem ()

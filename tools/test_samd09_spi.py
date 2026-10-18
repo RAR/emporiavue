@@ -17,7 +17,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "firmware/samd09/main_spi.c"
 
 
 def function(source: str, name: str) -> str:
-    match = re.search(rf"^(?:static )?(?:void|bool|uint8_t) {name}\([^;]*?\)\n\{{", source, re.M)
+    match = re.search(rf"^(?:static )?(?:void|bool|uint8_t) {name}\s*\([^;]*?\)\n\{{", source, re.M)
     if match is None:
         raise AssertionError(f"Function not found: {name}")
     depth = 1
@@ -56,6 +56,7 @@ struct DmaEnableRegister {
 } REG_DMAC_CHCTRLA;
 uint16_t REG_ADC_RESULT = 0;
 uint32_t REG_PORT_OUT = 0, REG_PORT_OUTSET = 0, REG_PORT_OUTCLR = 0;
+uint32_t REG_NVMCTRL_CTRLB = 0;
 #define STATUS_SYNCBUSY_BIT 0x80
 unsigned adc_resets = 0;
 unsigned adc_pin_offset = 3;
@@ -99,6 +100,21 @@ uint16_t read_uart_data() {
 
 
 TESTS = r"""
+void test_flash_sleep_configuration() {
+    // Reproduce main's temporary startup setting, then the final NVM setup.
+    // Changing only main's first write would fail this regression test.
+    for(uint32_t initial : {uint32_t(6),uint32_t(0x306),uint32_t(0xffffffff)}) {
+        REG_NVMCTRL_CTRLB=initial;
+        Config_NVMCTRL();
+        assert(REG_NVMCTRL_CTRLB==0x382);
+        assert(((REG_NVMCTRL_CTRLB>>8)&3)==3); // Flash auto-sleep disabled.
+        assert(((REG_NVMCTRL_CTRLB>>1)&15)==1); // Existing runtime wait states retained.
+        assert(REG_NVMCTRL_CTRLB&(1U<<7)); // Manual writes retained.
+        assert(!(REG_NVMCTRL_CTRLB&(1U<<18))); // Cache remains enabled.
+    }
+    std::puts("Flash wake safeguard: final NVM setup keeps Flash awake; MANW/RWS/cache unchanged");
+}
+
 void reset_stream() {
     after_adc_dma_enabled = nullptr;
     SpiBuildFrameIndex = SpiReadyHead = SpiReadyCount = SpiBuildScanIndex = 0;
@@ -561,6 +577,7 @@ void test_adc_recovery() {
     }
 }
 int main() {
+    test_flash_sleep_configuration();
     test_adc_startup();
     test_adc_ping_pong();
     test_queue_error_retention();
@@ -582,6 +599,7 @@ def main() -> None:
     declarations = source[source.index("volatile bool dmabool"):source.index("static uint32_t spi_enter_critical")]
     descriptors = source[source.index("struct DMAdescriptorType {"):source.index("#define __SIZE_OF__")]
     names = [
+        "Config_NVMCTRL",
         "spi_ready_queue_contains", "spi_find_free_build_frame",
         "finalize_spi_frame", "capture_spi_scan",
     ]
