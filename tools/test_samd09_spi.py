@@ -150,6 +150,14 @@ void crc32_hardware_update_byte(uint8_t value) {
     for (unsigned bit=0;bit<8;++bit)
         mock_crc = (mock_crc >> 1) ^ ((mock_crc & 1) ? 0xedb88320U : 0);
 }
+uint32_t reference_crc32(const uint8_t* bytes, unsigned length) {
+    uint32_t crc = 0xffffffffU;
+    for (unsigned index=0;index<length;++index) {
+        crc ^= bytes[index];
+        for (unsigned bit=0;bit<8;++bit) crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320U : 0);
+    }
+    return crc ^ 0xffffffffU;
+}
 uint32_t crc32_hardware_end() {
     assert_spi_setup_unmasked(); ++crc_end_calls; return mock_crc ^ 0xffffffffU;
 }
@@ -216,6 +224,7 @@ uint16_t read_uart_data() {
 
 TESTS = r"""
 void test_sleep_decision() {
+    // Vue 3 must never execute WFI (emporiavue#9): the idle wait neither sleeps nor masks.
     after_snapshot=nullptr;
     for(unsigned previous : {0U,1U}) {
         for(unsigned active : {0U,1U}) {
@@ -223,8 +232,8 @@ void test_sleep_decision() {
                 primask=previous; ram_sleep_calls=0;
                 SpiTxActive=active; SpiReadyCount=ready;
                 wait_for_spi_work();
-                assert(ram_sleep_calls==unsigned(active || ready==0));
-                assert(primask==previous); // Both paths restore the original mask exactly once.
+                assert(ram_sleep_calls==0);
+                assert(primask==previous);
             }
         }
     }
@@ -323,8 +332,7 @@ void test_spi_start_critical_scope() {
             assert(spi_critical_entries == 1 && spi_dma_enables == 1 && spi_dma_flag_clears == 1);
             assert(spi_sercom_interrupt_disables == 1 && spi_sercom_flag_clears == 1 && spi_sercom_reads == 1);
             assert(spi_cs_asserts == 1 && spi_cs_deasserts == 0 && spi_cs_low);
-            assert(crc_begin_calls == 1 && crc_byte_calls == SPI_FRAME_SIZE-SPI_CRC_SIZE && crc_end_calls == 1);
-            assert(SpiFrames[1].crc32 == (mock_crc ^ 0xffffffffU));
+            assert(SpiFrames[1].crc32 == reference_crc32((const uint8_t*) &SpiFrames[1], SPI_FRAME_SIZE-SPI_CRC_SIZE));
             assert(SpiTxActive && !SpiTxAwaitingComplete && SpiPendingFlags == 0);
             assert(SpiReadyHead == 0 && SpiReadyFrameIndex[0] == 1);
             assert(SpiReadyCount == ((preempt && !previous) ? 2 : 1));
@@ -362,7 +370,7 @@ void test_spi_start_critical_scope() {
                 SpiReadyCount = ready;
                 start_spi_dma_if_ready();
                 assert(primask == previous && spi_critical_entries == 0);
-                assert(crc_begin_calls == 0 && spi_cs_asserts == 0 && spi_dma_enables == 0);
+                assert(spi_cs_asserts == 0 && spi_dma_enables == 0);
                 assert(SpiTxActive == bool(active) && SpiReadyCount == ready);
                 track_spi_start = false;
             }
@@ -952,6 +960,8 @@ def main() -> None:
     source = SOURCE.read_text()
     declarations = source[source.index("volatile bool dmabool"):source.index("static uint32_t spi_enter_critical")]
     descriptors = source[source.index("struct DMAdescriptorType {"):source.index("#define __SIZE_OF__")]
+    crc_table = source[source.index("static const uint32_t Crc32Table[256]"):]
+    crc_table = crc_table[:crc_table.index("};") + 2]
     names = [
         "Config_NVMCTRL",
         "wait_for_spi_work",
@@ -974,7 +984,7 @@ def main() -> None:
     uart = "\n".join(function(source, name) for name in ["irq_handler_sercom0", "decode_vue3_voltage_packet"])
     adc = "\n".join(function(source, name) for name in ["prepare_adc_scan_start", "enable_adc_dma", "recover_adc_scan", "handle_adc_dma_interrupt"])
     program = "\n".join([
-        MOCKS, declarations, descriptors, common,
+        MOCKS, declarations, descriptors, crc_table, common,
         "#ifdef EMPORIAVUE_TARGET_VUE3", uart, "#endif", adc, TESTS,
     ])
     program = re.sub(r'__asm__ __volatile__\("dmb sy"(?: ::: "memory")?\);', '(void) 0;', program)
